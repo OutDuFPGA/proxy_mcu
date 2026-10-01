@@ -233,15 +233,21 @@ extern "C" {
    ends before the next frame start can re-trigger it. */
 #define IR_FRAME_PULSE_MAX_US           ((1000000U / IR_FRAME_PULSE_FPS) - 333U)
 
-/* What IR_LED_Init() starts both channels in, at IR_BOOT_CURRENT_MA:
-     IR_BOOT_FLASH_SYNC = 1: IR_MODE_FLASH_SYNC - LEDs gated by the sensor's
-                             FLASH on PC3 (default)
-     IR_BOOT_FLASH_SYNC = 0: IR_MODE_FRAME_PULSE, IR_FRAME_PULSE_DEFAULT_WIDTH_US
-                             per frame (0 width = boot dark, IR_MODE_OFF)
-   Either way the illuminator can be LIT AT BOOT. */
-#define IR_BOOT_FLASH_SYNC              1
+/* OPERATING MODE (2026-10-01): the sensor's FLASH (TOUT0) switches the LED.
+   PWM_DIM0/1 are held HIGH permanently (both channels IR_MODE_OFF), so Q2/Q3
+   pass FLASH straight to IR_CTRLx and the LED is on for exactly the FLASH
+   pulse width. The MCU only sets the current, through DAC_DIM0 (CTRL1).
+   Only CH0 has an LED driver fitted; CH1's DAC is left at 0.
+   IR_LED_Init() sets CH0 to IR_BOOT_CURRENT_MA. */
 #define IR_BOOT_CURRENT_MA              1000U
-#define IR_FRAME_PULSE_DEFAULT_WIDTH_US 10000U
+
+/* FLASH sync (IR_MODE_FLASH_SYNC) is BLOCKED while this is 0: SetMode
+   refuses it and ADC1 is never started, so PC3 is never touched beyond its
+   boot-time analog (high-Z) configuration. */
+#define IR_FLASH_SYNC_ENABLE            0
+
+/* FLASH input monitor: no PC3 edge for this long means "not toggling". */
+#define IR_FLASH_IDLE_MS                200U
 
 /* ---------------------------------------------------------------------------
    Derived limits. Computed at compile time from the constants above.
@@ -298,9 +304,8 @@ typedef enum {
 /* Call once from main(), after MX_GPIO_Init(). Brings up DAC1, forces both
    gates off, leaves FLASH (PC3) an input - never driven, sets both current
    setpoints to 0 and leaves IR_ENB_MCU deasserted. It then applies the boot
-   default on both channels: IR_BOOT_CURRENT_MA in IR_MODE_FLASH_SYNC (or
-   IR_MODE_FRAME_PULSE if IR_BOOT_FLASH_SYNC is 0) - so the illuminator IS
-   LIT from boot whenever the sensor drives FLASH.
+   default: both channels IR_MODE_OFF (PWM_DIMx HIGH, LED follows FLASH)
+   and CH0 at IR_BOOT_CURRENT_MA.
    Note that a 0 mA setpoint does NOT mean dark: the LT3763 keeps regulating
    at CTRL1 = 0V (its datasheet says only the PWM pin stops switching), and
    its +/-3mV current-amp offset alone is up to ~1.2A across R11. The gate is
@@ -540,6 +545,18 @@ bool IR_LED_RampCurrent_mA(IR_Channel_t ch, uint32_t target_ma,
 /* PC3 is input-only: returns true for IR_FLASH_SRC_HOST (no change - it is
    always an input) and false for IR_FLASH_SRC_MCU, which is never allowed. */
 bool IR_LED_SetFlashSource(IR_FlashSource_t src);
+
+/* FLASH input monitor. PC3 is a digital input with EXTI on both edges (read
+   only, never driven); edges are timed with the DWT cycle counter. */
+typedef struct {
+    bool     level_high;   /* PC3 right now */
+    bool     toggling;     /* an edge within IR_FLASH_IDLE_MS */
+    uint32_t falls;        /* falling edges since boot */
+    uint32_t period_us;    /* last fall-to-fall */
+    uint32_t low_us;       /* last fall-to-rise (low pulse width) */
+    uint32_t idle_ms;      /* since the last edge */
+} IR_FlashInput_t;
+void IR_LED_GetFlashInput(IR_FlashInput_t *in);
 IR_FlashSource_t IR_LED_GetFlashSource(void);
 
 /* ---------------------------------------------------------------------------

@@ -61,6 +61,7 @@ void UART4_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 void EXTI0_IRQHandler(void);   /* IR_FAULT1 (PE0) */
 void EXTI1_IRQHandler(void);   /* SN0_HS - sensor HSYNC (PB1) */
+void EXTI3_IRQHandler(void);   /* FLASH - sensor FLASH input (PC3) */
 void EXTI4_IRQHandler(void);   /* SN0_VS - sensor VSYNC (PC4) */
 void EXTI9_IRQHandler(void);   /* IR_FAULT0 (PB9) */
 /* USER CODE END EFP */

@@ -108,10 +108,11 @@ void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : FLASH_Pin
      INPUT ONLY - never drive PC3 (pin 11). The sensor's FLASH signal is
-     wired to it. Analog mode, because ADC1 reads it (FLASH sync) and its
-     ~2.3V high sits at the digital VIH threshold. */
+     wired to it. Digital input with an interrupt on both edges, so the
+     FLASH monitor (IR_LED_GetFlashInput) can time it. Its ~2.3V high is at
+     the guaranteed VIH (2.31V) but reads cleanly in practice (typ 1.9V). */
   GPIO_InitStruct.Pin = FLASH_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(FLASH_GPIO_Port, &GPIO_InitStruct);
 
@@ -245,6 +246,8 @@ void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI4_IRQn);
   HAL_NVIC_SetPriority(EXTI1_IRQn, 2, 0);   /* SN0_HS, PB1 - per line */
   HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 3, 0);   /* FLASH, PC3 - input monitor */
+  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 
 }
 

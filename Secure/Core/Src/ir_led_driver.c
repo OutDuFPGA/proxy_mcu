@@ -237,12 +237,8 @@ static void apply_channel(IR_Channel_t ch)
    IR_FLASH_SRC_MCU is kept in the enum for API compatibility but refused. */
 static void flash_release(void)
 {
-    GPIO_InitTypeDef init = {0};
-
-    init.Pin  = FLASH_Pin;
-    init.Mode = GPIO_MODE_ANALOG;
-    init.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(FLASH_GPIO_Port, &init);
+    /* PC3 itself is configured by MX_GPIO_Init() (digital input + EXTI3 for
+       the FLASH monitor); nothing here touches it. */
     s_flash_src = IR_FLASH_SRC_HOST;
 }
 
@@ -506,20 +502,14 @@ void IR_LED_Init(void)
     }
     s_gate_period_ticks = 0U;
 
-    /* Boot default on both channels, at IR_BOOT_CURRENT_MA: gated by the
-       sensor's FLASH (IR_BOOT_FLASH_SYNC), else one frame pulse per frame.
-       This LIGHTS the illuminator at boot. */
-#if (IR_BOOT_FLASH_SYNC != 0)
-    for (int i = 0; i < IR_CH_COUNT; i++) {
-        IR_LED_SetCurrent_mA((IR_Channel_t)i, IR_BOOT_CURRENT_MA);
-        (void)IR_LED_SetMode((IR_Channel_t)i, IR_MODE_FLASH_SYNC);
-    }
-#elif (IR_FRAME_PULSE_DEFAULT_WIDTH_US != 0U)
-    for (int i = 0; i < IR_CH_COUNT; i++) {
-        IR_LED_SetCurrent_mA((IR_Channel_t)i, IR_BOOT_CURRENT_MA);
-        IR_LED_SetFramePulse((IR_Channel_t)i, IR_FRAME_PULSE_DEFAULT_WIDTH_US);
-    }
-#endif
+    /* FLASH input monitor timestamps PC3 edges with the cycle counter. */
+    DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+
+    /* Operating mode: both channels stay IR_MODE_OFF, i.e. PWM_DIMx HIGH for
+       good - the sensor's FLASH switches the LED through Q2/Q3. Only the CH0
+       current is set; CH1 has no driver fitted and stays at 0. */
+    IR_LED_SetCurrent_mA(IR_CH0, IR_BOOT_CURRENT_MA);
 }
 
 void IR_LED_Task(void)
@@ -607,6 +597,12 @@ bool IR_LED_IsEnabled(void)
 bool IR_LED_SetMode(IR_Channel_t ch, IR_LedMode_t mode)
 {
     if (ch >= IR_CH_COUNT) return false;
+
+#if (IR_FLASH_SYNC_ENABLE == 0)
+    if (mode == IR_MODE_FLASH_SYNC) {
+        return false;   /* blocked: PC3 must not be used (IR_FLASH_SYNC_ENABLE) */
+    }
+#endif
 
     if (mode == IR_MODE_HOST_FLASH && s_flash_src != IR_FLASH_SRC_HOST) {
         /* The gate would follow our own FLASH output, which is held low, so
@@ -1120,7 +1116,13 @@ static void fs_start(void)
 
     if (s_fs_running) return;
 
-    flash_release();   /* already analog; PC3 is never driven */
+    {   /* ADC needs PC3 in analog mode (still an input, never driven) */
+        GPIO_InitTypeDef init = {0};
+        init.Pin  = FLASH_Pin;
+        init.Mode = GPIO_MODE_ANALOG;
+        init.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(FLASH_GPIO_Port, &init);
+    }
 
     __HAL_RCC_ADC_CLK_ENABLE();
     /* Asynchronous clock (adc_ker_ck = HCLK 64MHz, shared with the DAC's
@@ -1190,6 +1192,9 @@ static void fs_sync_running(void)
         if (s_ch[i].mode == IR_MODE_FLASH_SYNC) want = true;
     }
     want = want && s_master_enable;
+#if (IR_FLASH_SYNC_ENABLE == 0)
+    want = false;                   /* blocked: never start ADC1 on PC3 */
+#endif
 
     if (want && !s_fs_running)      fs_start();
     else if (!want && s_fs_running) fs_stop();
@@ -1385,6 +1390,47 @@ static inline void dac_tim_isr(IR_Channel_t ch)
 
 void TIM13_IRQHandler(void) { dac_tim_isr(IR_CH0); }
 void TIM14_IRQHandler(void) { dac_tim_isr(IR_CH1); }
+
+/* ---------------------------------------------------------------------------
+   FLASH input monitor (PC3: digital input, EXTI3 on both edges - read only)
+   --------------------------------------------------------------------------- */
+
+static volatile uint32_t s_fl_falls        = 0U;
+static volatile uint32_t s_fl_last_fall    = 0U;   /* DWT cycles */
+static volatile uint32_t s_fl_period_cyc   = 0U;   /* fall to fall */
+static volatile uint32_t s_fl_low_cyc      = 0U;   /* fall to rise */
+static volatile uint32_t s_fl_last_edge_ms = 0U;
+
+/* The STM32H5 HAL dispatches EXTI through these two callbacks, never through
+   HAL_GPIO_EXTI_Callback() below - so only FLASH is handled here. */
+void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin != FLASH_Pin) return;
+    uint32_t now = DWT->CYCCNT;
+    if (s_fl_falls != 0U) s_fl_period_cyc = now - s_fl_last_fall;
+    s_fl_last_fall    = now;
+    s_fl_falls++;
+    s_fl_last_edge_ms = HAL_GetTick();
+}
+
+void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin != FLASH_Pin) return;
+    if (s_fl_falls != 0U) s_fl_low_cyc = DWT->CYCCNT - s_fl_last_fall;
+    s_fl_last_edge_ms = HAL_GetTick();
+}
+
+void IR_LED_GetFlashInput(IR_FlashInput_t *in)
+{
+    uint32_t cyc_per_us = SystemCoreClock / 1000000U;
+
+    in->level_high = HAL_GPIO_ReadPin(FLASH_GPIO_Port, FLASH_Pin) == GPIO_PIN_SET;
+    in->falls      = s_fl_falls;
+    in->period_us  = s_fl_period_cyc / cyc_per_us;
+    in->low_us     = s_fl_low_cyc / cyc_per_us;
+    in->idle_ms    = HAL_GetTick() - s_fl_last_edge_ms;
+    in->toggling   = (s_fl_falls != 0U) && (in->idle_ms < IR_FLASH_IDLE_MS);
+}
 
 /**
   * @brief EXTI dispatcher for SN0_HS, SN0_VS, IR_FAULT0 and IR_FAULT1.

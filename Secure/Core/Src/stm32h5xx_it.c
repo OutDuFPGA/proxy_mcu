@@ -261,6 +261,14 @@ void EXTI1_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles EXTI Line 3 interrupt (FLASH, PC3 - input only).
+  */
+void EXTI3_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(FLASH_Pin);
+}
+
+/**
   * @brief This function handles EXTI Line 4 interrupt (SN0_VS, PC4 - sensor VSYNC).
   */
 void EXTI4_IRQHandler(void)

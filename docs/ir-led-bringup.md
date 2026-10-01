@@ -9,6 +9,34 @@ sheet 3, LT3763 datasheet Rev C. Firmware: `Secure/Core/Src/ir_led_driver.c`,
 
 ---
 
+## Current operating mode (2026-10-01)
+
+**The sensor's FLASH signal switches the LED; the MCU only sets the current.**
+
+- `PWM_DIM0` and `PWM_DIM1` are held **HIGH** permanently. With `PWM_DIMx`
+  high, Q2/Q3 pass the FLASH net straight to `IR_CTRLx`, so the LED is on for
+  exactly the FLASH (TOUT0) pulse width.
+- `FLASH` (PC3, pin 11) is an input only; the MCU never drives it. `flash`
+  mode (ADC1 on PC3) is blocked (`IR_FLASH_SYNC_ENABLE` = 0).
+- The current is set through `DAC_DIM0` (LT3763 CTRL1). Boot value is
+  `IR_BOOT_CURRENT_MA` (1000 mA).
+- Only CH0 has an LED driver fitted. CH1's DAC stays at 0.
+- `FAULT0` reads low even while the LED is lit (the LT3763 also flags FB
+  outside 0.25-1.16 V), so it is shown in `ir status` but not acted on.
+
+The console has only these IR commands:
+
+```
+ir status          PWM_DIM0, DAC_DIM0 and FAULT0 state
+ir ma <mA>         LED current via DAC_DIM0 (clamped to the 3000 mA limit)
+ir mv <mV>         DAC_DIM0 voltage directly
+```
+
+Sections 3-11 below describe the earlier firmware and its `ir ch<0|1> ...`
+commands, which have been removed. They are kept for the hardware notes.
+
+---
+
 ## 0. Read this first
 
 Three things about this hardware will mislead you if you do not know them.
@@ -33,16 +61,22 @@ turn off the MCU-driven gate, not light that comes through `FLASH`.
 across the 2.5 mΩ sense resistor. A channel gated on at `ma 0` visibly lit the
 scene on the camera stream. Use `mode off` / `pulse off` to make it dark.
 
-**The illuminator is lit from boot.** `IR_LED_Init()` sets both channels to
-1000 mA (`IR_BOOT_CURRENT_MA`) in `flash` mode: each LED is on while the
-sensor pulls FLASH (PC3) low, i.e. once per frame, synchronised to the
-sensor (thresholds 600/300 mV). Set `IR_BOOT_FLASH_SYNC` to 0 in
-`ir_led_driver.h` to boot in `fpulse` instead: one
-`IR_FRAME_PULSE_DEFAULT_WIDTH_US` pulse at every frame start, where frame
+**`flash` mode is blocked** (`IR_FLASH_SYNC_ENABLE` = 0 in
+`ir_led_driver.h`): `ir chN mode flash` is refused and ADC1 never starts,
+so PC3 stays in its high-Z analog state. Set it to 1 to re-enable.
+
+**The firmware boots dark.** `IR_LED_Init()` leaves both channels `off` with
+0 setpoints. Set `IR_BOOT_FLASH_SYNC` to 1 in `ir_led_driver.h` to boot in
+`flash` mode at `IR_BOOT_CURRENT_MA` (each LED on while the sensor pulls
+FLASH low, thresholds 600/300 mV), or set `IR_FRAME_PULSE_DEFAULT_WIDTH_US`
+to boot in `fpulse`: one `IR_FRAME_PULSE_DEFAULT_WIDTH_US` pulse at every frame start, where frame
 start is the `SN0_VS` (PC4) edge, or TIM7 at 30.000 Hz while none has
 arrived for 100 ms (`sync=VSYNC` / `sync=free-run 30Hz` in `ir status`). Before
 bench work that needs the LEDs dark, run `ir ch0 mode off` and
-`ir ch1 mode off`.
+`ir ch1 mode off` - but since PC3 is input-only, a channel can still light
+while the sensor holds FLASH high (it reaches IR_CTRLx through Q2/Q3).
+Only removing the 18V supply, or a hardware change on the FLASH net,
+guarantees dark.
 
 **`FAULT` low does not mean something is broken.** The LT3763 pulls FAULT low
 whenever the inductor current is below 10% of maximum, which includes every
@@ -305,31 +339,8 @@ cannot pull `FLASH` low.
 
 ## Quick reference
 
-```
-ir status                          full state, both channels
-ir limits                          ceiling, resolution, where they come from
-ir dac                             DAC output state + PWM state, both channels
-ir enable | ir disable             IR_ENB_MCU + gates
-ir limit [<mA>]                    bench current cap (default and max 3000)
-ir flash host                      PC3 is input-only (`mcu` is refused)
-ir sync                            SN0_HS / SN0_VS activity counters
-ir ch<0|1> mode off|cont|strobe|host
-ir ch<0|1> ma <milliamps>          setpoint via CTRL1 DAC
-ir ch<0|1> mv <millivolts>         DAC_DIMx output voltage directly
-ir ch<0|1> fpulse <ms>|off         LED pulse at every frame start (VSYNC, else 30Hz)
-ir ch<0|1> mode flash              LED on while sensor FLASH on PC3 is active (ADC watchdog)
-ir flash level                     PC3 mV, FLASH active/idle, edge count
-ir flash polarity high|low         exposing level (default low = nFLASH)
-ir flash thresh <hi_mV> <lo_mV>    watchdog hysteresis (default 600/300)
-ir ch<0|1> pulse <on_ms> <off_ms>  gate LED on/off for exact times (TIM12)
-ir ch<0|1> pulse off               stop, channel goes off
-ir ch<0|1> pwm <hz> <duty%>        chop DAC_DIMx between 0V and setpoint
-ir ch<0|1> pwm off                 back to steady DC
-ir ch<0|1> ramp <mA> [step] [ms]   stepped ramp, aborts on fault
-ir ch<0|1> raw <0-4095>            raw DAC code
-ir ch<0|1> window <start> <end>    strobe window in sensor lines
-ir ch<0|1> clearfault              re-arm a latched fault
-```
+See "Current operating mode" at the top: `ir status`, `ir ma <mA>`,
+`ir mv <mV>`. The commands used in sections 3-11 are no longer built.
 
 ## 11. DAC-generated PWM on DAC_DIM0 / DAC_DIM1
 

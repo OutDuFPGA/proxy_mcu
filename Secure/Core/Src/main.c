@@ -169,7 +169,7 @@ static void CLI_DisplayMenu(void) {
   CLI_Print("  iris_run <dir> <hz>   - Spin Iris continuously\r\n");
   CLI_Print("  iris_stop             - Stop Iris\r\n");
   CLI_Print("  focus_dump            - Dump Focus Registers\r\n");
-  CLI_Print("  ir help               - IR LED driver (enable, mode, ramp, current, window...)\r\n");
+  CLI_Print("  ir help               - IR LED current (status, ma, mv)\r\n");
   CLI_Print("\r\nMCU> ");
 }
 
