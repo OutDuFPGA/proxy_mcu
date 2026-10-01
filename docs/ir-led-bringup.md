@@ -21,10 +21,28 @@ boards are being commanded on. `MX_GPIO_Init()` closes that window by writing
 the ODR high before switching the pins to outputs. **Do not power the 18V rail
 before the MCU has booted.**
 
-**`FLASH` (PC3) is part of the gate, not a separate feature.** It is the source
-of both inverters. The firmware drives it low so `IR_CTRLx = NOT(PWM_DIMx)`. It
-is also wired to the host SoC on the sheet 3 connector — if the host drives it,
-you get contention. Keep the host's end high-Z for all bench work below.
+**`FLASH` (PC3, pin 11) is an input only — the MCU never drives it.** The
+sensor's FLASH signal is wired to it. The firmware keeps PC3 in analog mode
+from boot (ADC1 reads it for `mode flash`), and `ir flash mcu` is refused.
+`FLASH` is still the source of both Q2/Q3 inverters, so while it is high
+`PWM_DIMx` cannot force a channel dark — `ir disable` and a latched fault only
+turn off the MCU-driven gate, not light that comes through `FLASH`.
+
+**`0 mA` does not mean dark.** The LT3763 keeps switching at `CTRL1` = 0 V
+(only its `PWM` pin stops it), and its ±3 mV current-amp offset is up to ~1.2 A
+across the 2.5 mΩ sense resistor. A channel gated on at `ma 0` visibly lit the
+scene on the camera stream. Use `mode off` / `pulse off` to make it dark.
+
+**The illuminator is lit from boot.** `IR_LED_Init()` sets both channels to
+1000 mA (`IR_BOOT_CURRENT_MA`) in `flash` mode: each LED is on while the
+sensor pulls FLASH (PC3) low, i.e. once per frame, synchronised to the
+sensor (thresholds 600/300 mV). Set `IR_BOOT_FLASH_SYNC` to 0 in
+`ir_led_driver.h` to boot in `fpulse` instead: one
+`IR_FRAME_PULSE_DEFAULT_WIDTH_US` pulse at every frame start, where frame
+start is the `SN0_VS` (PC4) edge, or TIM7 at 30.000 Hz while none has
+arrived for 100 ms (`sync=VSYNC` / `sync=free-run 30Hz` in `ir status`). Before
+bench work that needs the LEDs dark, run `ir ch0 mode off` and
+`ir ch1 mode off`.
 
 **`FAULT` low does not mean something is broken.** The LT3763 pulls FAULT low
 whenever the inductor current is below 10% of maximum, which includes every
@@ -190,9 +208,11 @@ At each stage verify:
 
 Then repeat the whole of sections 5–6 for channel 1 on `J6` / `PE0`.
 
-> The bench cap is **4000 mA** by default (`IR_LED_DEFAULT_LIMIT_MA`). `ir ma`
-> and `ir ramp` both clamp to it, so a slipped digit cannot command the board's
-> full 4.9 A. Raise it deliberately with `ir limit 4500` if you need to.
+> Current is **hard-capped at 3000 mA** (`IR_LED_HARD_LIMIT_MA`), enforced on
+> the DAC code itself: `ma`, `mv`, `raw`, `ramp` and DAC PWM all stop at code
+> 273 (220 mV on CTRL1, ~2992 mA), and `ir limit` can lower the cap but not
+> raise it past 3000. Changing it needs a rebuild. With the cap in place, the
+> 4 A steps above clamp to ~3 A.
 
 ## 7. Fault behaviour
 
@@ -270,23 +290,16 @@ move the line counter to a timer in external-clock mode instead of EXTI.
 
 ## 10. Host-driven strobe (optional)
 
-To let the host SoC gate the LEDs through `FLASH` instead of the MCU:
+`FLASH` is always an input, so to let it gate a channel directly:
 
 ```
-ir ch0 mode off
-ir ch1 mode off
-ir flash host          # PC3 becomes an input; host now drives FLASH
 ir ch0 mode host       # PWM_DIM0 high, so IR_CTRL0 follows FLASH
 ir enable
 ```
 
-Order matters — `ir flash host` is refused while any channel is in a mode
-other than `host` or `off`, because releasing `FLASH` would float those
-channels' gates.
-
-Note the asymmetry: with the host owning `FLASH`, `PWM_DIMx` alone can no
-longer force a channel dark. `ir disable` and any confirmed fault therefore
-reclaim `FLASH` as an output low and drop `host` channels to `off`.
+`PWM_DIMx` alone can never force a channel dark while `FLASH` is high.
+`ir disable` and any confirmed fault drop `host` channels to `off`, but they
+cannot pull `FLASH` low.
 
 ---
 
@@ -297,12 +310,19 @@ ir status                          full state, both channels
 ir limits                          ceiling, resolution, where they come from
 ir dac                             DAC output state + PWM state, both channels
 ir enable | ir disable             IR_ENB_MCU + gates
-ir limit [<mA>]                    bench current cap (default 4000)
-ir flash mcu|host                  who drives PC3
+ir limit [<mA>]                    bench current cap (default and max 3000)
+ir flash host                      PC3 is input-only (`mcu` is refused)
 ir sync                            SN0_HS / SN0_VS activity counters
 ir ch<0|1> mode off|cont|strobe|host
 ir ch<0|1> ma <milliamps>          setpoint via CTRL1 DAC
 ir ch<0|1> mv <millivolts>         DAC_DIMx output voltage directly
+ir ch<0|1> fpulse <ms>|off         LED pulse at every frame start (VSYNC, else 30Hz)
+ir ch<0|1> mode flash              LED on while sensor FLASH on PC3 is active (ADC watchdog)
+ir flash level                     PC3 mV, FLASH active/idle, edge count
+ir flash polarity high|low         exposing level (default low = nFLASH)
+ir flash thresh <hi_mV> <lo_mV>    watchdog hysteresis (default 600/300)
+ir ch<0|1> pulse <on_ms> <off_ms>  gate LED on/off for exact times (TIM12)
+ir ch<0|1> pulse off               stop, channel goes off
 ir ch<0|1> pwm <hz> <duty%>        chop DAC_DIMx between 0V and setpoint
 ir ch<0|1> pwm off                 back to steady DC
 ir ch<0|1> ramp <mA> [step] [ms]   stepped ramp, aborts on fault

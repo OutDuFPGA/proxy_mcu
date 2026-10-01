@@ -41,10 +41,10 @@
   *   PWM_DIMx = 0  ->  Q off  ->  IR_CTRLx = 3V3     -> LEDs ON
   *   PWM_DIMx = 1  ->  Q on   ->  IR_CTRLx = FLASH
   *
-  * With FLASH held low by the MCU this is a plain inverter and the MCU owns
-  * the strobe. With FLASH released (PC3 as input) and PWM_DIMx = 1, the host
-  * SoC's FLASH signal passes straight through to the LED boards instead.
-  * IR_FlashSource_t selects between those two; see IR_LED_SetFlashSource().
+  * PC3 is an INPUT ONLY (the sensor's FLASH is wired to it) - the MCU never
+  * drives it. So with PWM_DIMx = 1 the external FLASH level passes straight
+  * through to IR_CTRLx: the MCU can force a channel ON (PWM_DIMx = 0) but
+  * can only make it dark while FLASH is low.
   *
   * The practical consequence, and the reason this file exists in its current
   * form: PWM_DIMx LOW means LIGHT ON. Every gate write below goes through
@@ -162,12 +162,18 @@ extern "C" {
    DAC itself is a legitimate thing to want) but the console warns. */
 #define IR_CTRL_ABS_MAX_MV          3000U
 
+/* Hard cap on the LED current, in milliamps. Enforced on the DAC code itself
+   in IR_LED_SetCurrentRaw(), so no entry point - mA, mV, raw code, ramp or
+   DAC PWM - can command more, and "ir limit" cannot raise the soft cap
+   above it. Compile-time only. It caps the SETPOINT: with CTRL1 near 0V the
+   LT3763's current-amp offset can still pass up to ~1.2A (see
+   IR_LED_Init), which is below this cap. */
+#define IR_LED_HARD_LIMIT_MA        3000U
+
 /* Bench safety cap on the commanded current, in milliamps, applied on top of
-   the hardware ceiling. Defaults to the 4A the illuminator is being brought
-   up at, so a slipped digit on the console cannot command the board's full
-   ~4.9A into the LED string. Adjustable at runtime with
-   IR_LED_SetCurrentLimit_mA() / "ir limit <mA>". */
-#define IR_LED_DEFAULT_LIMIT_MA     4000U
+   the hard cap above. Adjustable at runtime (up to IR_LED_HARD_LIMIT_MA)
+   with IR_LED_SetCurrentLimit_mA() / "ir limit <mA>". */
+#define IR_LED_DEFAULT_LIMIT_MA     IR_LED_HARD_LIMIT_MA
 
 /* Default step size and dwell for IR_LED_RampCurrent_mA(). 100mA every 20ms
    takes a 0 -> 4A ramp about 800ms, which is slow enough to watch the ISMON
@@ -181,6 +187,61 @@ extern "C" {
    reaches the 0.36V CTRL2 clamp in well under 1ms) plus output capacitor
    charging into the LED string, with a wide margin. */
 #define IR_FAULT_BLANKING_MS        50U
+
+/* ---------------------------------------------------------------------------
+   FLASH sync (IR_MODE_FLASH_SYNC)
+   ---------------------------------------------------------------------------
+   The sensor's exposure signal arrives on PC3 at 1.8V, too low for the 3.3V
+   digital input (VIH 2.31V guaranteed), so ADC1 samples it and its analog
+   watchdogs detect the edges - see the FLASH sync section of
+   ir_led_driver.c. While FLASH is active, every FLASH_SYNC channel's gate is
+   ON at its current setpoint; otherwise OFF. */
+
+/* Hysteresis thresholds on PC3, in millivolts: rising past HIGH counts as a
+   high level, falling past LOW as a low level. Measured on the board
+   (2026-10-01): the sensor's open collector pulls FLASH to 0-80mV; released,
+   FLASH is pulled to ~2.3V only through Q2/Q3, i.e. only while the gates are
+   off. While a gate is on, a released FLASH floats at ~0.9-1.4V. So "low"
+   must mean "actively pulled" (< LOW) and anything above HIGH is released -
+   thresholds above the float level latch the gate on (seen: 20ms max-on
+   cut at 30Hz). Adjustable at runtime: "ir flash thresh". */
+#define IR_FLASH_TH_HIGH_MV             600U
+#define IR_FLASH_TH_LOW_MV              300U
+
+/* Which level means "exposing". false = active LOW, i.e. nFLASH: TOUT0
+   inverted by Q1 on the sensor board. Set true if TOUT0 is wired straight
+   to PC3 (TOUT0 is high during exposure). Runtime: "ir flash polarity". */
+#define IR_FLASH_ACTIVE_HIGH_DEFAULT    false
+
+/* Safety: a FLASH that stays active longer than this (one 30fps frame plus
+   margin) gates the LEDs off until FLASH next goes idle. */
+#define IR_FLASH_MAX_ON_MS              40U
+
+/* ---------------------------------------------------------------------------
+   Frame pulse (IR_MODE_FRAME_PULSE) and boot defaults
+   --------------------------------------------------------------------------- */
+
+/* Sensor frame rate. The IMX568 is configured for 30 fps, so without a
+   VSYNC edge the MCU generates its own frame start at this rate. */
+#define IR_FRAME_PULSE_FPS              30U
+
+/* A VSYNC edge older than this means sync is lost: TIM7 takes over and fires
+   the pulses at IR_FRAME_PULSE_FPS until VSYNC edges return. */
+#define IR_VSYNC_TIMEOUT_MS             100U
+
+/* Longest pulse allowed: one frame period less a margin, so a pulse always
+   ends before the next frame start can re-trigger it. */
+#define IR_FRAME_PULSE_MAX_US           ((1000000U / IR_FRAME_PULSE_FPS) - 333U)
+
+/* What IR_LED_Init() starts both channels in, at IR_BOOT_CURRENT_MA:
+     IR_BOOT_FLASH_SYNC = 1: IR_MODE_FLASH_SYNC - LEDs gated by the sensor's
+                             FLASH on PC3 (default)
+     IR_BOOT_FLASH_SYNC = 0: IR_MODE_FRAME_PULSE, IR_FRAME_PULSE_DEFAULT_WIDTH_US
+                             per frame (0 width = boot dark, IR_MODE_OFF)
+   Either way the illuminator can be LIT AT BOOT. */
+#define IR_BOOT_FLASH_SYNC              1
+#define IR_BOOT_CURRENT_MA              1000U
+#define IR_FRAME_PULSE_DEFAULT_WIDTH_US 10000U
 
 /* ---------------------------------------------------------------------------
    Derived limits. Computed at compile time from the constants above.
@@ -217,16 +278,16 @@ typedef enum {
     IR_MODE_CONTINUOUS,       /* Gate held on. No sensor sync needed.            */
     IR_MODE_FRAME_STROBE,     /* Gated window per frame, counted in sensor lines */
     IR_MODE_HOST_FLASH,       /* Gate follows the host SoC's FLASH line          */
-    IR_MODE_GATE_PWM          /* TIM12 chops the gate: true PWM dimming          */
+    IR_MODE_GATE_PWM,         /* TIM12 chops the gate: true PWM dimming          */
+    IR_MODE_FRAME_PULSE,      /* One timed pulse per sensor frame (VSYNC/30Hz)   */
+    IR_MODE_FLASH_SYNC        /* Gate follows sensor FLASH on PC3 via ADC watchdog */
 } IR_LedMode_t;
 
 typedef enum {
-    /* PC3 driven low by this MCU. IR_CTRLx is then a clean inverter of
-       PWM_DIMx and the MCU owns strobing. This is the default. The host SoC
-       must leave its end of FLASH high-impedance. */
+    /* PC3 driven low by this MCU. NOT SUPPORTED: PC3 is an input only (the
+       sensor's FLASH is wired to it); IR_LED_SetFlashSource() refuses it. */
     IR_FLASH_SRC_MCU = 0,
-    /* PC3 released to an input so the host SoC drives FLASH. Only meaningful
-       together with IR_MODE_HOST_FLASH. */
+    /* PC3 is an analog input; FLASH is driven externally. Always the case. */
     IR_FLASH_SRC_HOST
 } IR_FlashSource_t;
 
@@ -235,9 +296,16 @@ typedef enum {
    --------------------------------------------------------------------------- */
 
 /* Call once from main(), after MX_GPIO_Init(). Brings up DAC1, forces both
-   gates off, takes ownership of FLASH (drives PC3 low), sets both current
-   setpoints to 0 and leaves IR_ENB_MCU deasserted. Nothing illuminates until
-   IR_LED_Enable(true) and a mode other than IR_MODE_OFF. */
+   gates off, leaves FLASH (PC3) an input - never driven, sets both current
+   setpoints to 0 and leaves IR_ENB_MCU deasserted. It then applies the boot
+   default on both channels: IR_BOOT_CURRENT_MA in IR_MODE_FLASH_SYNC (or
+   IR_MODE_FRAME_PULSE if IR_BOOT_FLASH_SYNC is 0) - so the illuminator IS
+   LIT from boot whenever the sensor drives FLASH.
+   Note that a 0 mA setpoint does NOT mean dark: the LT3763 keeps regulating
+   at CTRL1 = 0V (its datasheet says only the PWM pin stops switching), and
+   its +/-3mV current-amp offset alone is up to ~1.2A across R11. The gate is
+   the only real off switch - confirmed on the camera stream, where a gated
+   channel at "0 mA" visibly lit the scene. */
 void IR_LED_Init(void);
 
 /* Call from the main loop. Runs fault confirmation (see note 3 in the file
@@ -304,12 +372,12 @@ uint16_t IR_LED_GetCurrentRaw(IR_Channel_t ch);
 uint32_t IR_LED_GetCtrlVoltage_mV(IR_Channel_t ch);
 
 /* Drives DAC_DIMx to a specific output voltage, in millivolts, rather than
-   to a current. Clamped to the DAC's own full scale (IR_DAC_VREF_MV); NOT
-   clamped to IR_CTRL_ABS_MAX_MV or to the current limit, because the point
-   of this entry point is direct control of the pin - for metering PA4/PA5,
-   sweeping CTRL1 against ISMON on TP2, or checking the CTRL2 clamp. Callers
-   that want a current should use IR_LED_SetCurrent_mA() instead.
-   Returns the voltage actually applied after rounding to the nearest code. */
+   to a current. Clamped to the code for IR_LED_HARD_LIMIT_MA (~220mV at
+   3A); not clamped to the soft current limit, because the point of this
+   entry point is direct control of the pin - for metering PA4/PA5 or
+   sweeping CTRL1 against ISMON on TP2. Callers that want a current should
+   use IR_LED_SetCurrent_mA() instead.
+   Returns the voltage actually applied after rounding and the hard cap. */
 uint32_t IR_LED_SetCtrlVoltage_mV(IR_Channel_t ch, uint32_t millivolts);
 
 /* Smallest voltage step the DAC can resolve, in microvolts. */
@@ -390,6 +458,56 @@ bool IR_LED_GetDacPwm(IR_Channel_t ch, uint32_t *freq_hz, uint32_t *duty_pct);
    (off, and continuous, respectively). */
 bool IR_LED_SetGatePwm(IR_Channel_t ch, uint32_t freq_hz, uint32_t duty_pct);
 
+/* Same hardware gate PWM, specified as time instead of frequency and duty:
+   the LEDs are ON (IR_CTRLx high, PWM_DIMx low) for on_us, then OFF for
+   off_us, repeating. Meant for strobe-like timings that do not come out as
+   a whole number of Hz - 33000 on / 77000 off is a 110ms period (9.09Hz),
+   reproduced exactly. The period is shared with the other channel (one
+   timer), so setting it here changes the other channel's period too.
+   Returns false for a bad channel or a period outside
+   IR_GATE_PERIOD_MIN_US..IR_GATE_PERIOD_MAX_US. on_us = 0 is steady off and
+   off_us = 0 is steady on, as with duty 0 / 100 above.
+   The LT3763 needs each on-time to span at least two switching cycles
+   (~8us at the board's ~250kHz) to reach the set current. */
+#define IR_GATE_PERIOD_MIN_US       (1000000U / IR_GATE_PWM_MAX_HZ)
+#define IR_GATE_PERIOD_MAX_US       10000000U
+bool IR_LED_SetGatePulse(IR_Channel_t ch, uint32_t on_us, uint32_t off_us);
+
+/* On/off times actually programmed after timer rounding, in microseconds.
+   True while this channel is being chopped by TIM12. */
+bool IR_LED_GetGatePulse(IR_Channel_t ch, uint32_t *on_us, uint32_t *off_us);
+
+/* Puts the channel into IR_MODE_FRAME_PULSE: the LED goes ON for width_us at
+   every frame start, then OFF until the next one. Frame start is the SN0_VS
+   (PC4) edge; while none has arrived for IR_VSYNC_TIMEOUT_MS, TIM7 generates
+   frame starts at IR_FRAME_PULSE_FPS instead (free-running, so it drifts
+   slowly against the sensor's own frames). The pulse itself is TIM12 in
+   one-pulse mode, so its width is exact to 1us with no ISR on the falling
+   edge. The width is shared with the other channel (one timer); a channel of
+   the other in IR_MODE_GATE_PWM is switched off, since both need TIM12.
+   width_us is clamped to 1..IR_FRAME_PULSE_MAX_US; 0 turns the channel off. */
+bool IR_LED_SetFramePulse(IR_Channel_t ch, uint32_t width_us);
+
+/* Width in us; true while the channel is in IR_MODE_FRAME_PULSE. */
+bool IR_LED_GetFramePulse(IR_Channel_t ch, uint32_t *width_us);
+
+/* Frame-pulse diagnostics: pulses fired since boot, and whether the last one
+   came from a real VSYNC edge (true) or the TIM7 fallback (false). */
+uint32_t IR_LED_GetFramePulseCount(void);
+
+/* FLASH sync. Enter it with IR_LED_SetMode(ch, IR_MODE_FLASH_SYNC): PC3 is
+   released to analog and ADC1 starts; leaving the mode on every channel (or
+   IR_LED_Enable(false)) stops the ADC and drives PC3 low again. */
+void IR_LED_SetFlashPolarity(bool active_high);
+bool IR_LED_GetFlashActiveHigh(void);
+/* low_mv must be below high_mv. Returns false otherwise. */
+bool IR_LED_SetFlashThresholds_mV(uint32_t high_mv, uint32_t low_mv);
+void IR_LED_GetFlashThresholds_mV(uint32_t *high_mv, uint32_t *low_mv);
+/* Live PC3 level, whether FLASH is active now, and edges since boot.
+   Returns true while the ADC is running. */
+bool IR_LED_GetFlashSyncStatus(uint32_t *level_mv, bool *active, uint32_t *edges);
+bool     IR_LED_FramePulseIsSynced(void);
+
 /* Stops the hardware PWM and returns the channel to IR_MODE_OFF. */
 void IR_LED_StopGatePwm(IR_Channel_t ch);
 
@@ -419,12 +537,8 @@ bool IR_LED_RampCurrent_mA(IR_Channel_t ch, uint32_t target_ma,
    FLASH net ownership
    --------------------------------------------------------------------------- */
 
-/* Reconfigures PC3. Switching to IR_FLASH_SRC_HOST while any channel is in a
-   mode other than IR_MODE_HOST_FLASH is rejected (returns false), because
-   releasing FLASH would leave those channels' gates floating.
-   Note the asymmetry: with the host owning FLASH the MCU can no longer force
-   a channel dark through PWM_DIMx alone, so IR_LED_Enable(false) and any
-   confirmed fault both reclaim FLASH as an output low. */
+/* PC3 is input-only: returns true for IR_FLASH_SRC_HOST (no change - it is
+   always an input) and false for IR_FLASH_SRC_MCU, which is never allowed. */
 bool IR_LED_SetFlashSource(IR_FlashSource_t src);
 IR_FlashSource_t IR_LED_GetFlashSource(void);
 

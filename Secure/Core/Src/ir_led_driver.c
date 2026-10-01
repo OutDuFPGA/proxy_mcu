@@ -39,7 +39,7 @@ typedef struct {
 static volatile uint32_t s_line_counter  = 0;
 static volatile uint32_t s_frame_counter = 0;
 static volatile bool     s_master_enable = false;
-static IR_FlashSource_t  s_flash_src     = IR_FLASH_SRC_MCU;
+static IR_FlashSource_t  s_flash_src     = IR_FLASH_SRC_HOST;
 static uint32_t          s_limit_ma      = IR_LED_DEFAULT_LIMIT_MA;
 
 /* DAC-PWM state. TIM12 is shared, so the frequency is global while the duty
@@ -49,13 +49,26 @@ static volatile bool     s_pwm_on[IR_CH_COUNT] = { false, false };
 static volatile uint32_t s_pwm_duty[IR_CH_COUNT] = { 0U, 0U };
 
 static volatile bool     s_gate_pwm_on[IR_CH_COUNT] = { false, false };
-static volatile uint32_t s_gate_duty[IR_CH_COUNT] = { 0U, 0U };
-static uint32_t          s_gate_freq = 0U;
+/* Gate PWM timing, in TIM12 input-clock ticks (IR_TIM_CLK_HZ) rather than
+   Hz and percent, so that a period given in time - e.g. 33ms on / 77ms off -
+   is reproduced exactly instead of being rounded through an integer Hz.
+   The period is shared (one timer); the on-time is per channel. */
+static volatile uint32_t s_gate_on_ticks[IR_CH_COUNT] = { 0U, 0U };
+static uint32_t          s_gate_period_ticks = 0U;
+
+/* Frame-pulse state. TIM12 runs in one-pulse mode (1us ticks) and is started
+   once per frame by fp_fire(), from the VSYNC EXTI or the TIM7 fallback. */
+static uint32_t          s_fp_width_us   = 0U;
+static volatile uint32_t s_fp_count      = 0U;
+static volatile uint32_t s_last_vsync_ms = 0U;
+static volatile bool     s_vsync_seen    = false;
+static volatile bool     s_fp_synced     = false;
 
 /* Timers count at the APB1 timer clock. AHB and APB1 are both /1 off a 64MHz
    SYSCLK (see SystemClock_Config), and with an APB prescaler of 1 the timer
    clock equals PCLK rather than twice it. */
 #define IR_TIM_CLK_HZ            64000000U
+#define IR_TICKS_PER_US          (IR_TIM_CLK_HZ / 1000000U)
 
 /* DAC modulation moved off TIM12 when TIM12 was given to the gates: PB14 can
    only reach TIM12_CH1, so the hardware dictates which peripheral owns the
@@ -146,21 +159,31 @@ static void gate_pin_to_tim12(IR_Channel_t ch)
    FRAME_STROBE's gate belongs to the sync ISRs, so this only forces it off on
    entry; the next VSYNC re-establishes the window. */
 static void gate_pwm_apply(IR_Channel_t ch);   /* fwd decl */
+static void fp_apply(IR_Channel_t ch);         /* fwd decl */
+static void fp_fire(bool from_vsync);          /* fwd decl */
+static void fs_sync_running(void);             /* fwd decl */
+static void fs_task(void);                     /* fwd decl */
+static bool fs_gate_wanted(void);              /* fwd decl */
+static void evict_other_tim12_user(IR_Channel_t ch, IR_LedMode_t conflicting);
 
 static void apply_channel(IR_Channel_t ch)
 {
     IR_ChannelState_t *c = &s_ch[ch];
 
+    /* Start or stop the PC3 ADC to match whether any channel needs it. */
+    fs_sync_running();
+
     /* Any state other than "actively chopping" must first take the pin back
        from TIM12, otherwise the timer would keep driving it regardless of
        what the mode says. */
-    if (c->mode != IR_MODE_GATE_PWM || !s_master_enable || c->fault_latched) {
+    if ((c->mode != IR_MODE_GATE_PWM && c->mode != IR_MODE_FRAME_PULSE) ||
+        !s_master_enable || c->fault_latched) {
         if (s_gate_pwm_on[ch]) {
             s_gate_pwm_on[ch] = false;
             TIM12->CCER &= ~((ch == IR_CH0) ? TIM_CCER_CC1E : TIM_CCER_CC2E);
             if (!s_gate_pwm_on[IR_CH0] && !s_gate_pwm_on[IR_CH1]) {
                 TIM12->CR1 &= ~TIM_CR1_CEN;
-                s_gate_freq = 0U;
+                s_gate_period_ticks = 0U;
             }
             gate_pin_to_gpio(ch);
         }
@@ -174,6 +197,14 @@ static void apply_channel(IR_Channel_t ch)
     switch (c->mode) {
         case IR_MODE_GATE_PWM:
             gate_pwm_apply(ch);
+            break;
+
+        case IR_MODE_FRAME_PULSE:
+            fp_apply(ch);
+            break;
+
+        case IR_MODE_FLASH_SYNC:
+            gate_set(ch, fs_gate_wanted());
             break;
 
         case IR_MODE_CONTINUOUS:
@@ -201,45 +232,24 @@ static void apply_channel(IR_Channel_t ch)
    FLASH net ownership (PC3)
    --------------------------------------------------------------------------- */
 
-static void flash_configure(IR_FlashSource_t src)
+/* PC3 is an INPUT ONLY: the sensor's FLASH signal is wired to it, so the MCU
+   must never drive it. It is always analog (ADC1 reads it for FLASH sync).
+   IR_FLASH_SRC_MCU is kept in the enum for API compatibility but refused. */
+static void flash_release(void)
 {
     GPIO_InitTypeDef init = {0};
 
-    init.Pin   = FLASH_Pin;
-    init.Pull  = GPIO_NOPULL;
-    init.Speed = GPIO_SPEED_FREQ_HIGH;
-
-    if (src == IR_FLASH_SRC_MCU) {
-        /* Park it low before switching to an output so the pin never drives
-           a stale 1 into the inverter sources. */
-        HAL_GPIO_WritePin(FLASH_GPIO_Port, FLASH_Pin, GPIO_PIN_RESET);
-        init.Mode = GPIO_MODE_OUTPUT_PP;
-    } else {
-        init.Mode = GPIO_MODE_INPUT;
-    }
+    init.Pin  = FLASH_Pin;
+    init.Mode = GPIO_MODE_ANALOG;
+    init.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(FLASH_GPIO_Port, &init);
-    s_flash_src = src;
+    s_flash_src = IR_FLASH_SRC_HOST;
 }
 
 bool IR_LED_SetFlashSource(IR_FlashSource_t src)
 {
-    if (src == s_flash_src) {
-        return true;
-    }
-    if (src == IR_FLASH_SRC_HOST) {
-        /* Releasing FLASH leaves the source of every inverter floating, so
-           only channels that are meant to follow the host may be active. */
-        for (int i = 0; i < IR_CH_COUNT; i++) {
-            if (s_ch[i].mode != IR_MODE_HOST_FLASH && s_ch[i].mode != IR_MODE_OFF) {
-                return false;
-            }
-        }
-    }
-    flash_configure(src);
-    for (int i = 0; i < IR_CH_COUNT; i++) {
-        apply_channel((IR_Channel_t)i);
-    }
-    return true;
+    /* PC3 is input-only; driving it (IR_FLASH_SRC_MCU) is never allowed. */
+    return src == IR_FLASH_SRC_HOST;
 }
 
 IR_FlashSource_t IR_LED_GetFlashSource(void)
@@ -308,10 +318,32 @@ static uint16_t ma_to_code(uint32_t milliamps)
     return (uint16_t)code;
 }
 
+/* Highest DAC code whose current does not exceed IR_LED_HARD_LIMIT_MA.
+   ma_to_code() rounds to nearest, which can land one code above the limit
+   (3000mA -> code 274 -> 3006mA), so step down until the readback fits. */
+static uint16_t hard_limit_code(void)
+{
+    static uint16_t code = 0U;
+    static bool     done = false;
+
+    if (!done) {
+        code = ma_to_code(IR_LED_HARD_LIMIT_MA);
+        while (code > 0U && mv_to_ma(code_to_mv(code)) > IR_LED_HARD_LIMIT_MA) {
+            code--;
+        }
+        done = true;
+    }
+    return code;
+}
+
 void IR_LED_SetCurrentRaw(IR_Channel_t ch, uint16_t code_12bit)
 {
     if (ch >= IR_CH_COUNT) return;
     if (code_12bit > DAC1_CODE_MAX) code_12bit = DAC1_CODE_MAX;
+
+    /* Hard cap. Every DAC write - mA, mV, raw code, ramp, DAC PWM - goes
+       through raw_code, which is only ever set here. */
+    if (code_12bit > hard_limit_code()) code_12bit = hard_limit_code();
 
     s_ch[ch].raw_code = code_12bit;
     DAC1_SetValue(s_ch[ch].dac_channel, code_12bit);
@@ -334,8 +366,8 @@ void IR_LED_SetCurrent_mA(IR_Channel_t ch, uint32_t milliamps)
 
 void IR_LED_SetCurrentLimit_mA(uint32_t milliamps)
 {
-    if (milliamps > IR_LED_MAX_CURRENT_MA) {
-        milliamps = IR_LED_MAX_CURRENT_MA;
+    if (milliamps > IR_LED_HARD_LIMIT_MA) {
+        milliamps = IR_LED_HARD_LIMIT_MA;
     }
     s_limit_ma = milliamps;
 
@@ -414,10 +446,10 @@ uint32_t IR_LED_SetCtrlVoltage_mV(IR_Channel_t ch, uint32_t millivolts)
     }
     IR_LED_SetCurrentRaw(ch, (uint16_t)code);
 
-    /* Report back what the quantised code actually produces, not what was
-       asked for - at ~0.8mV per code the two differ, and a caller printing
-       the request would be quietly lying about the pin voltage. */
-    return code_to_mv((uint16_t)code);
+    /* Report back what the quantised, hard-capped code actually produces,
+       not what was asked for - a caller printing the request would be
+       quietly lying about the pin voltage. */
+    return code_to_mv(s_ch[ch].raw_code);
 }
 
 uint32_t IR_LED_GetCtrlStep_uV(void)
@@ -454,9 +486,8 @@ void IR_LED_Init(void)
     s_master_enable = true;
     HAL_GPIO_WritePin(IR_ENB_MCU_GPIO_Port, IR_ENB_MCU_Pin, GPIO_PIN_SET);
 
-    /* Take the FLASH net. Until this runs PC3 is whatever MX_GPIO_Init() left
-       it as, which is an input, i.e. the inverter sources are floating. */
-    flash_configure(IR_FLASH_SRC_MCU);
+    /* PC3 (FLASH) is an input from the sensor - never driven. */
+    flash_release();
 
     MX_DAC1_Init();
     for (int i = 0; i < IR_CH_COUNT; i++) {
@@ -471,14 +502,29 @@ void IR_LED_Init(void)
         s_pwm_duty[i]    = 0U;
         s_pwm_freq_ch[i] = 0U;
         s_gate_pwm_on[i] = false;
-        s_gate_duty[i]   = 0U;
+        s_gate_on_ticks[i] = 0U;
     }
-    s_gate_freq = 0U;
+    s_gate_period_ticks = 0U;
+
+    /* Boot default on both channels, at IR_BOOT_CURRENT_MA: gated by the
+       sensor's FLASH (IR_BOOT_FLASH_SYNC), else one frame pulse per frame.
+       This LIGHTS the illuminator at boot. */
+#if (IR_BOOT_FLASH_SYNC != 0)
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        IR_LED_SetCurrent_mA((IR_Channel_t)i, IR_BOOT_CURRENT_MA);
+        (void)IR_LED_SetMode((IR_Channel_t)i, IR_MODE_FLASH_SYNC);
+    }
+#elif (IR_FRAME_PULSE_DEFAULT_WIDTH_US != 0U)
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        IR_LED_SetCurrent_mA((IR_Channel_t)i, IR_BOOT_CURRENT_MA);
+        IR_LED_SetFramePulse((IR_Channel_t)i, IR_FRAME_PULSE_DEFAULT_WIDTH_US);
+    }
+#endif
 }
 
 void IR_LED_Task(void)
 {
-    uint32_t now = HAL_GetTick();
+    fs_task();
 
     for (int i = 0; i < IR_CH_COUNT; i++) {
         IR_ChannelState_t *c = &s_ch[i];
@@ -498,7 +544,11 @@ void IR_LED_Task(void)
         if (!c->gate_is_on) {
             continue;
         }
-        if ((now - c->gate_on_tick) < IR_FAULT_BLANKING_MS) {
+        /* Re-read the tick after gate_on_tick: an ISR (FLASH sync) can turn
+           the gate on after a tick sampled earlier, and 'tick - gate_on_tick'
+           would then wrap to ~2^32 and skip the blanking entirely. */
+        uint32_t on_tick = c->gate_on_tick;
+        if ((HAL_GetTick() - on_tick) < IR_FAULT_BLANKING_MS) {
             continue;
         }
         if (HAL_GPIO_ReadPin(c->fault_port, c->fault_pin) != GPIO_PIN_RESET) {
@@ -522,16 +572,15 @@ void IR_LED_Task(void)
 
 void IR_LED_Enable(bool enable)
 {
-    if (!enable && s_flash_src == IR_FLASH_SRC_HOST) {
-        /* With the host owning FLASH, PWM_DIMx alone cannot force a channel
-           dark. Reclaim the net so "disabled" really means dark, and drop
-           any HOST_FLASH channels to OFF so the state stays coherent. */
+    if (!enable) {
+        /* FLASH (PC3) is input-only, so it cannot be reclaimed: while the
+           sensor holds FLASH high, PWM_DIMx alone cannot force a channel
+           dark. Drop HOST_FLASH channels to OFF so the state stays coherent. */
         for (int i = 0; i < IR_CH_COUNT; i++) {
             if (s_ch[i].mode == IR_MODE_HOST_FLASH) {
                 s_ch[i].mode = IR_MODE_OFF;
             }
         }
-        flash_configure(IR_FLASH_SRC_MCU);
     }
 
     s_master_enable = enable;
@@ -645,6 +694,9 @@ void IR_LED_OnVSync(void)
 {
     s_line_counter = 0;
     s_frame_counter++;
+    s_last_vsync_ms = HAL_GetTick();
+    s_vsync_seen    = true;
+    fp_fire(true);
 
     if (!s_master_enable) return;
 
@@ -689,14 +741,17 @@ void IR_LED_OnFaultEdge(IR_Channel_t ch)
    never has to think in complements. */
 static void gate_pwm_apply(IR_Channel_t ch)
 {
-    uint32_t period, psc, arr, ccr;
+    uint32_t period, on, psc, arr, ccr;
 
-    if (s_gate_duty[ch] == 0U) {        /* steady off */
+    period = s_gate_period_ticks;
+    on     = s_gate_on_ticks[ch];
+
+    if (period == 0U || on == 0U) {     /* steady off */
         gate_pin_to_gpio(ch);
         gate_set(ch, false);
         return;
     }
-    if (s_gate_duty[ch] >= 100U) {      /* steady on */
+    if (on >= period) {                 /* steady on */
         gate_pin_to_gpio(ch);
         gate_set(ch, true);
         return;
@@ -704,18 +759,24 @@ static void gate_pwm_apply(IR_Channel_t ch)
 
     __HAL_RCC_TIM12_CLK_ENABLE();
 
-    period = IR_TIM_CLK_HZ / ((s_gate_freq != 0U) ? s_gate_freq : IR_GATE_PWM_MIN_HZ);
-    psc    = (period + 65535U) / 65536U;
-    if (psc == 0U) psc = 1U;
-    arr    = (period / psc);
-    if (arr == 0U) arr = 1U;
-    if (arr > 65536U) arr = 65536U;
+    /* TIM12 is 16 bit, so a period longer than 65536 ticks needs a
+       prescaler. When the period is a whole number of microseconds, round
+       the prescaler up to a multiple of IR_TICKS_PER_US so each count is a
+       whole number of microseconds too - that keeps millisecond on/off
+       times exact (110ms -> PSC 128, ARR 55000, CCR 16500) instead of
+       landing a fraction of a count off. */
+    psc = (period + 65535U) / 65536U;
+    if (psc > 1U && (period % IR_TICKS_PER_US) == 0U) {
+        psc = ((psc + IR_TICKS_PER_US - 1U) / IR_TICKS_PER_US) * IR_TICKS_PER_US;
+    }
+    arr = period / psc;
+    if (arr < 2U) arr = 2U;
 
-    ccr = (arr * s_gate_duty[ch]) / 100U;
+    ccr = on / psc;
     if (ccr == 0U)  ccr = 1U;
     if (ccr >= arr) ccr = arr - 1U;
 
-    TIM12->CR1 &= ~TIM_CR1_CEN;
+    TIM12->CR1 &= ~(TIM_CR1_CEN | TIM_CR1_OPM);   /* free-running, not frame pulse */
     TIM12->PSC  = (uint16_t)(psc - 1U);
     TIM12->ARR  = (uint16_t)(arr - 1U);
 
@@ -736,8 +797,10 @@ static void gate_pwm_apply(IR_Channel_t ch)
     TIM12->SR   = 0U;
     TIM12->CR1 |= TIM_CR1_CEN;
 
-    s_gate_freq       = IR_TIM_CLK_HZ / (psc * arr);
-    s_gate_pwm_on[ch] = true;
+    /* Record what the hardware is really doing after rounding. */
+    s_gate_period_ticks  = psc * arr;
+    s_gate_on_ticks[ch]  = psc * ccr;
+    s_gate_pwm_on[ch]    = true;
     gate_pin_to_tim12(ch);
     /* The timer owns the pin now; gate_is_on is meaningless while chopping,
        and fault confirmation sits out (see IR_LED_Task). */
@@ -746,15 +809,38 @@ static void gate_pwm_apply(IR_Channel_t ch)
 
 bool IR_LED_SetGatePwm(IR_Channel_t ch, uint32_t freq_hz, uint32_t duty_pct)
 {
+    uint32_t period;
+
     if (ch >= IR_CH_COUNT) return false;
+    evict_other_tim12_user(ch, IR_MODE_FRAME_PULSE);
 
     if (freq_hz < IR_GATE_PWM_MIN_HZ) freq_hz = IR_GATE_PWM_MIN_HZ;
     if (freq_hz > IR_GATE_PWM_MAX_HZ) freq_hz = IR_GATE_PWM_MAX_HZ;
     if (duty_pct > 100U)              duty_pct = 100U;
 
-    s_gate_freq     = freq_hz;
-    s_gate_duty[ch] = duty_pct;
-    s_ch[ch].mode   = IR_MODE_GATE_PWM;
+    period = IR_TIM_CLK_HZ / freq_hz;
+    s_gate_period_ticks = period;
+    s_gate_on_ticks[ch] = (uint32_t)(((uint64_t)period * duty_pct) / 100U);
+    s_ch[ch].mode       = IR_MODE_GATE_PWM;
+    apply_channel(ch);
+    return true;
+}
+
+bool IR_LED_SetGatePulse(IR_Channel_t ch, uint32_t on_us, uint32_t off_us)
+{
+    uint64_t period_us;
+
+    if (ch >= IR_CH_COUNT) return false;
+    evict_other_tim12_user(ch, IR_MODE_FRAME_PULSE);
+
+    period_us = (uint64_t)on_us + off_us;
+    if (period_us < IR_GATE_PERIOD_MIN_US || period_us > IR_GATE_PERIOD_MAX_US) {
+        return false;
+    }
+
+    s_gate_period_ticks = (uint32_t)(period_us * IR_TICKS_PER_US);
+    s_gate_on_ticks[ch] = on_us * IR_TICKS_PER_US;
+    s_ch[ch].mode       = IR_MODE_GATE_PWM;
     apply_channel(ch);
     return true;
 }
@@ -762,17 +848,424 @@ bool IR_LED_SetGatePwm(IR_Channel_t ch, uint32_t freq_hz, uint32_t duty_pct)
 void IR_LED_StopGatePwm(IR_Channel_t ch)
 {
     if (ch >= IR_CH_COUNT) return;
-    s_gate_duty[ch] = 0U;
-    s_ch[ch].mode   = IR_MODE_OFF;
+    s_gate_on_ticks[ch] = 0U;
+    s_ch[ch].mode       = IR_MODE_OFF;
     apply_channel(ch);
 }
 
 bool IR_LED_GetGatePwm(IR_Channel_t ch, uint32_t *freq_hz, uint32_t *duty_pct)
 {
+    uint32_t period = s_gate_period_ticks;
+
     if (ch >= IR_CH_COUNT) return false;
-    if (freq_hz)  *freq_hz  = s_gate_freq;
-    if (duty_pct) *duty_pct = s_gate_duty[ch];
-    return s_gate_pwm_on[ch];
+    if (freq_hz)  *freq_hz  = (period != 0U) ? (IR_TIM_CLK_HZ + period / 2U) / period : 0U;
+    if (duty_pct) *duty_pct = (period != 0U)
+                              ? (uint32_t)(((uint64_t)s_gate_on_ticks[ch] * 100U + period / 2U) / period)
+                              : 0U;
+    return s_gate_pwm_on[ch] && s_ch[ch].mode == IR_MODE_GATE_PWM;
+}
+
+bool IR_LED_GetGatePulse(IR_Channel_t ch, uint32_t *on_us, uint32_t *off_us)
+{
+    uint32_t period = s_gate_period_ticks;
+    uint32_t on;
+
+    if (ch >= IR_CH_COUNT) return false;
+    on = s_gate_on_ticks[ch];
+    if (on > period) on = period;
+    if (on_us)  *on_us  = on / IR_TICKS_PER_US;
+    if (off_us) *off_us = (period - on) / IR_TICKS_PER_US;
+    return s_gate_pwm_on[ch] && s_ch[ch].mode == IR_MODE_GATE_PWM;
+}
+
+/* ---------------------------------------------------------------------------
+   Frame pulse (TIM12 one-pulse, started from VSYNC or the TIM7 fallback)
+   --------------------------------------------------------------------------- */
+
+#define IR_FP_TIM7_IRQ_PRIO   1U     /* same as SN0_VS: both start a frame */
+
+/* TIM12 has one counter for both channels, so frame pulse and gate PWM
+   cannot run side by side. Whichever is being set up switches the other
+   channel off if it is using the conflicting mode. */
+static void evict_other_tim12_user(IR_Channel_t ch, IR_LedMode_t conflicting)
+{
+    IR_Channel_t other = (ch == IR_CH0) ? IR_CH1 : IR_CH0;
+
+    if (s_ch[other].mode == conflicting) {
+        s_ch[other].mode = IR_MODE_OFF;
+        apply_channel(other);
+    }
+}
+
+/* TIM7: a free-running IR_FRAME_PULSE_FPS tick that stands in for VSYNC.
+   Left running once frame pulse has been used; its ISR does nothing while
+   real VSYNC edges keep arriving. */
+static void fp_tim7_start(void)
+{
+    __HAL_RCC_TIM7_CLK_ENABLE();
+    if (TIM7->CR1 & TIM_CR1_CEN) return;
+
+    TIM7->CR1  = 0U;
+    TIM7->PSC  = (uint16_t)(IR_TICKS_PER_US - 1U);                 /* 1us */
+    TIM7->ARR  = (uint16_t)((1000000U / IR_FRAME_PULSE_FPS) - 1U); /* 33333us */
+    TIM7->EGR  = TIM_EGR_UG;
+    TIM7->SR   = 0U;
+    TIM7->DIER = TIM_DIER_UIE;
+    HAL_NVIC_SetPriority(TIM7_IRQn, IR_FP_TIM7_IRQ_PRIO, 0);
+    HAL_NVIC_EnableIRQ(TIM7_IRQn);
+    TIM7->CR1  = TIM_CR1_CEN;
+}
+
+/* Programs TIM12 for one-pulse operation and hands this channel's pin to it.
+   PWM mode 2 with CCR = 1 and ACTIVE LOW polarity: the output is inactive
+   (pin high, LED off) while CNT < 1, active (pin low, LED on) from CNT = 1
+   to ARR, and in one-pulse mode the counter stops at the update event with
+   CNT = 0 - back to inactive. So each start of the counter is exactly one
+   pulse of ARR us (1us after the trigger), and a stopped timer is dark. */
+static void fp_apply(IR_Channel_t ch)
+{
+    if (s_fp_width_us == 0U) {
+        gate_pin_to_gpio(ch);
+        gate_set(ch, false);
+        return;
+    }
+
+    __HAL_RCC_TIM12_CLK_ENABLE();
+
+    TIM12->CR1 &= ~TIM_CR1_CEN;
+    TIM12->CR1 |= TIM_CR1_OPM;
+    TIM12->PSC  = (uint16_t)(IR_TICKS_PER_US - 1U);
+    TIM12->ARR  = (uint16_t)s_fp_width_us;
+
+    if (ch == IR_CH0) {
+        TIM12->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_CC1S | TIM_CCMR1_OC1PE);
+        TIM12->CCMR1 |= (7UL << TIM_CCMR1_OC1M_Pos);
+        TIM12->CCR1   = 1U;
+        TIM12->CCER  |= TIM_CCER_CC1P | TIM_CCER_CC1E;
+    } else {
+        TIM12->CCMR1 &= ~(TIM_CCMR1_OC2M | TIM_CCMR1_CC2S | TIM_CCMR1_OC2PE);
+        TIM12->CCMR1 |= (7UL << TIM_CCMR1_OC2M_Pos);
+        TIM12->CCR2   = 1U;
+        TIM12->CCER  |= TIM_CCER_CC2P | TIM_CCER_CC2E;
+    }
+    /* Load PSC/ARR without starting: UG clears CNT, and with CEN clear the
+       output sits at the inactive (dark) level. */
+    TIM12->EGR = TIM_EGR_UG;
+    TIM12->SR  = 0U;
+
+    s_gate_pwm_on[ch]   = true;       /* timer owns the pin */
+    gate_pin_to_tim12(ch);
+    s_ch[ch].gate_is_on = false;      /* fault confirmation sits out */
+
+    fp_tim7_start();
+}
+
+/* One frame start: fire one pulse on every channel in frame-pulse mode.
+   Called from interrupt context (SN0_VS EXTI or TIM7). */
+static void fp_fire(bool from_vsync)
+{
+    bool any = false;
+
+    if (!s_master_enable) return;
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        if (s_ch[i].mode == IR_MODE_FRAME_PULSE && s_gate_pwm_on[i] &&
+            !s_ch[i].fault_latched) {
+            any = true;
+        }
+    }
+    if (!any) return;
+
+    TIM12->CNT  = 0U;
+    TIM12->CR1 |= TIM_CR1_CEN;
+    s_fp_count++;
+    s_fp_synced = from_vsync;
+}
+
+void TIM7_IRQHandler(void)
+{
+    if (TIM7->SR & TIM_SR_UIF) {
+        TIM7->SR = ~TIM_SR_UIF;
+        if (!s_vsync_seen || (HAL_GetTick() - s_last_vsync_ms) > IR_VSYNC_TIMEOUT_MS) {
+            fp_fire(false);
+        }
+    }
+}
+
+bool IR_LED_SetFramePulse(IR_Channel_t ch, uint32_t width_us)
+{
+    if (ch >= IR_CH_COUNT) return false;
+
+    if (width_us == 0U) {
+        s_ch[ch].mode = IR_MODE_OFF;
+        apply_channel(ch);
+        return true;
+    }
+    if (width_us > IR_FRAME_PULSE_MAX_US) width_us = IR_FRAME_PULSE_MAX_US;
+
+    evict_other_tim12_user(ch, IR_MODE_GATE_PWM);
+    s_fp_width_us = width_us;
+    s_ch[ch].mode = IR_MODE_FRAME_PULSE;
+    apply_channel(ch);
+
+    /* The width is shared: re-apply the other channel if it is also pulsing
+       so both outputs follow the new ARR. */
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        if (i != (int)ch && s_ch[i].mode == IR_MODE_FRAME_PULSE) {
+            apply_channel((IR_Channel_t)i);
+        }
+    }
+    return true;
+}
+
+bool IR_LED_GetFramePulse(IR_Channel_t ch, uint32_t *width_us)
+{
+    if (ch >= IR_CH_COUNT) return false;
+    if (width_us) *width_us = s_fp_width_us;
+    return s_ch[ch].mode == IR_MODE_FRAME_PULSE;
+}
+
+uint32_t IR_LED_GetFramePulseCount(void) { return s_fp_count; }
+bool     IR_LED_FramePulseIsSynced(void) { return s_fp_synced; }
+
+/* ---------------------------------------------------------------------------
+   FLASH sync (IR_MODE_FLASH_SYNC): ADC1 analog watchdog on PC3
+   ---------------------------------------------------------------------------
+   The IMX568 drives TOUT0 at 1.8V. PC3 runs from the 3.3V I/O supply, whose
+   VIH is 0.7 x VDDIO = 2.31V guaranteed (0.52 x VDDIO + 0.18 = 1.90V
+   characterised, DS14258 Table 58) - above TOUT0's 1.6-1.8V high level, so
+   the digital input cannot be trusted with it. PC3 is also ADC12_INP13, so
+   ADC1 converts it continuously and two analog watchdogs turn the level into
+   edges, with hysteresis:
+
+     AWD1 (12 bit, window [0, HIGH]) flags once the level rises above HIGH
+     AWD2 ( 8 bit, window [LOW, max]) flags once it falls below LOW
+
+   Only the watchdog for the edge being waited for has its interrupt enabled,
+   so a level that sits high or low produces no interrupts at all - just one
+   per crossing. Conversions run free at ~0.8us each (32MHz ADC clock, 12.5
+   cycle sample + 12.5 cycle conversion), so the gate follows FLASH within
+   about 1-2us. */
+
+#define IR_FS_ADC                 ADC1
+#define IR_FS_ADC_COMMON          ADC12_COMMON
+#define IR_FS_ADC_CHANNEL         13U       /* PC3 = ADC12_INP13 */
+#define IR_FS_ADC_IRQ_PRIO        0U        /* gate timing; same level as faults */
+#define IR_FS_ADC_FULL_MV         IR_DAC_VREF_MV   /* VREF+ = VDDA = 3.3V */
+
+static volatile bool     s_fs_running     = false;
+static volatile bool     s_fs_level_high  = false;  /* last detected level   */
+static volatile bool     s_fs_blocked     = false;  /* max-on cut, until idle */
+static volatile uint32_t s_fs_edges       = 0U;
+static volatile uint32_t s_fs_on_ms       = 0U;     /* tick at the last on   */
+static bool              s_fs_active_high = IR_FLASH_ACTIVE_HIGH_DEFAULT;
+static uint32_t          s_fs_th_high_mv  = IR_FLASH_TH_HIGH_MV;
+static uint32_t          s_fs_th_low_mv   = IR_FLASH_TH_LOW_MV;
+
+static bool fs_active(void)
+{
+    return s_fs_level_high == s_fs_active_high;
+}
+
+static bool fs_gate_wanted(void)
+{
+    return s_fs_running && s_master_enable && fs_active() && !s_fs_blocked;
+}
+
+/* Drives every FLASH_SYNC channel's gate from the current FLASH state. */
+static void fs_drive_gates(void)
+{
+    bool on = fs_gate_wanted();
+
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        if (s_ch[i].mode == IR_MODE_FLASH_SYNC) {
+            gate_set((IR_Channel_t)i, on && !s_ch[i].fault_latched);
+        }
+    }
+    if (on) {
+        s_fs_on_ms = HAL_GetTick();
+    }
+}
+
+/* Arms the watchdog for the opposite edge of the level just seen. */
+static void fs_arm(void)
+{
+    IR_FS_ADC->IER = s_fs_level_high ? ADC_IER_AWD2IE : ADC_IER_AWD1IE;
+    IR_FS_ADC->ISR = ADC_ISR_AWD1 | ADC_ISR_AWD2;
+}
+
+static void fs_load_thresholds(void)
+{
+    uint32_t hi12 = (s_fs_th_high_mv * 4095U) / IR_FS_ADC_FULL_MV;
+    uint32_t lo8  = (s_fs_th_low_mv  * 255U)  / IR_FS_ADC_FULL_MV;
+
+    if (hi12 > 4095U) hi12 = 4095U;
+    if (lo8  > 255U)  lo8  = 255U;
+    IR_FS_ADC->TR1 = (hi12 << ADC_TR1_HT1_Pos) | (0U << ADC_TR1_LT1_Pos);
+    IR_FS_ADC->TR2 = (255U << ADC_TR2_HT2_Pos) | (lo8 << ADC_TR2_LT2_Pos);
+}
+
+static bool fs_wait(volatile uint32_t *reg, uint32_t mask, bool set)
+{
+    uint32_t t0 = HAL_GetTick();
+
+    while (((*reg & mask) != 0U) != set) {
+        if ((HAL_GetTick() - t0) > 10U) return false;
+    }
+    return true;
+}
+
+static void fs_start(void)
+{
+    ADC_TypeDef *adc = IR_FS_ADC;
+
+    if (s_fs_running) return;
+
+    flash_release();   /* already analog; PC3 is never driven */
+
+    __HAL_RCC_ADC_CLK_ENABLE();
+    /* Asynchronous clock (adc_ker_ck = HCLK 64MHz, shared with the DAC's
+       ADCDACSEL) divided by 2: 32MHz, inside the 75MHz limit. */
+    IR_FS_ADC_COMMON->CCR = (IR_FS_ADC_COMMON->CCR & ~(ADC_CCR_CKMODE | ADC_CCR_PRESC))
+                          | (1UL << ADC_CCR_PRESC_Pos);
+
+    if (adc->CR & ADC_CR_ADEN) {
+        adc->CR |= ADC_CR_ADSTP;
+        (void)fs_wait(&adc->CR, ADC_CR_ADSTP, false);
+        adc->CR |= ADC_CR_ADDIS;
+        (void)fs_wait(&adc->CR, ADC_CR_ADEN, false);
+    }
+    adc->CR = ADC_CR_ADVREGEN;              /* DEEPPWD = 0, regulator on */
+    HAL_Delay(1);                           /* tADCVREG_STUP is 20us     */
+    adc->CR = ADC_CR_ADVREGEN | ADC_CR_ADCAL;
+    (void)fs_wait(&adc->CR, ADC_CR_ADCAL, false);
+
+    adc->ISR = ADC_ISR_ADRDY;
+    adc->CR  = ADC_CR_ADVREGEN | ADC_CR_ADEN;
+    (void)fs_wait(&adc->ISR, ADC_ISR_ADRDY, true);
+
+    adc->SMPR2 = (adc->SMPR2 & ~ADC_SMPR2_SMP13) | (2UL << ADC_SMPR2_SMP13_Pos); /* 12.5 */
+    adc->SQR1  = IR_FS_ADC_CHANNEL << ADC_SQR1_SQ1_Pos;                          /* L = 1 */
+    adc->CFGR  = ADC_CFGR_CONT | ADC_CFGR_OVRMOD
+               | ADC_CFGR_AWD1SGL | ADC_CFGR_AWD1EN
+               | (IR_FS_ADC_CHANNEL << ADC_CFGR_AWD1CH_Pos);
+    adc->AWD2CR = 1UL << IR_FS_ADC_CHANNEL;
+    fs_load_thresholds();
+
+    adc->IER = 0U;
+    adc->CR |= ADC_CR_ADSTART;
+    (void)fs_wait(&adc->ISR, ADC_ISR_EOC, true);
+
+    /* Seed the state from the first conversion, then wait for its opposite. */
+    s_fs_level_high = ((adc->DR * IR_FS_ADC_FULL_MV) / 4095U) > s_fs_th_high_mv;
+    s_fs_blocked    = false;
+    s_fs_running    = true;
+    fs_arm();
+    HAL_NVIC_SetPriority(ADC1_IRQn, IR_FS_ADC_IRQ_PRIO, 0);
+    HAL_NVIC_EnableIRQ(ADC1_IRQn);
+}
+
+/* Stops the ADC. PC3 stays an analog input - it is never driven. */
+static void fs_stop(void)
+{
+    ADC_TypeDef *adc = IR_FS_ADC;
+
+    if (!s_fs_running) return;
+
+    HAL_NVIC_DisableIRQ(ADC1_IRQn);
+    adc->IER = 0U;
+    adc->CR |= ADC_CR_ADSTP;
+    (void)fs_wait(&adc->CR, ADC_CR_ADSTP, false);
+    adc->CR |= ADC_CR_ADDIS;
+    (void)fs_wait(&adc->CR, ADC_CR_ADEN, false);
+    adc->ISR = 0xFFFFFFFFU;
+    s_fs_running = false;
+}
+
+/* Runs the ADC only while some channel needs it and output is enabled. */
+static void fs_sync_running(void)
+{
+    bool want = false;
+
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        if (s_ch[i].mode == IR_MODE_FLASH_SYNC) want = true;
+    }
+    want = want && s_master_enable;
+
+    if (want && !s_fs_running)      fs_start();
+    else if (!want && s_fs_running) fs_stop();
+}
+
+void ADC1_IRQHandler(void)
+{
+    uint32_t isr = IR_FS_ADC->ISR & IR_FS_ADC->IER;
+
+    if (isr & ADC_ISR_AWD1) {           /* rose above HIGH */
+        s_fs_level_high = true;
+    } else if (isr & ADC_ISR_AWD2) {    /* fell below LOW  */
+        s_fs_level_high = false;
+    } else {
+        IR_FS_ADC->ISR = IR_FS_ADC->ISR & (ADC_ISR_AWD1 | ADC_ISR_AWD2);
+        return;
+    }
+    s_fs_edges++;
+    if (!fs_active()) {
+        s_fs_blocked = false;           /* exposure over: re-arm max-on cut */
+    }
+    fs_arm();
+    fs_drive_gates();
+}
+
+/* Called from IR_LED_Task(): ends a pulse that has outlasted
+   IR_FLASH_MAX_ON_MS (FLASH stuck active), until FLASH next goes idle. */
+static void fs_task(void)
+{
+    if (!s_fs_running || s_fs_blocked || !fs_active()) return;
+    if ((HAL_GetTick() - s_fs_on_ms) > IR_FLASH_MAX_ON_MS) {
+        s_fs_blocked = true;
+        fs_drive_gates();
+    }
+}
+
+void IR_LED_SetFlashPolarity(bool active_high)
+{
+    s_fs_active_high = active_high;
+    if (s_fs_running) {
+        s_fs_blocked = false;
+        fs_drive_gates();
+    }
+}
+
+bool IR_LED_GetFlashActiveHigh(void) { return s_fs_active_high; }
+
+bool IR_LED_SetFlashThresholds_mV(uint32_t high_mv, uint32_t low_mv)
+{
+    if (low_mv >= high_mv || high_mv >= IR_FS_ADC_FULL_MV) return false;
+    s_fs_th_high_mv = high_mv;
+    s_fs_th_low_mv  = low_mv;
+    if (s_fs_running) {
+        /* TR1/TR2 are only written with conversions stopped. */
+        IR_FS_ADC->CR |= ADC_CR_ADSTP;
+        (void)fs_wait(&IR_FS_ADC->CR, ADC_CR_ADSTP, false);
+        fs_load_thresholds();
+        fs_arm();
+        IR_FS_ADC->CR |= ADC_CR_ADSTART;
+    }
+    return true;
+}
+
+void IR_LED_GetFlashThresholds_mV(uint32_t *high_mv, uint32_t *low_mv)
+{
+    if (high_mv) *high_mv = s_fs_th_high_mv;
+    if (low_mv)  *low_mv  = s_fs_th_low_mv;
+}
+
+bool IR_LED_GetFlashSyncStatus(uint32_t *level_mv, bool *active, uint32_t *edges)
+{
+    if (level_mv) *level_mv = s_fs_running
+                              ? ((IR_FS_ADC->DR & 0xFFFU) * IR_FS_ADC_FULL_MV) / 4095U : 0U;
+    if (active)   *active   = s_fs_running && fs_active();
+    if (edges)    *edges    = s_fs_edges;
+    return s_fs_running;
 }
 
 /* ---------------------------------------------------------------------------

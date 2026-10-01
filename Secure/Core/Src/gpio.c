@@ -91,13 +91,6 @@ void MX_GPIO_Init(void)
      Do not "tidy" this back into the RESET group above. */
   HAL_GPIO_WritePin(GPIOB, PWM_DIM0_Pin|PWM_DIM1_Pin, GPIO_PIN_SET);
 
-  /*Configure GPIO pin Output Level : FLASH_Pin
-     FLASH is the source of both inverters above, so it has to be a defined
-     low for PWM_DIMx to gate anything. Parked low here and reconfigured as an
-     output a few lines down; IR_LED_SetFlashSource() can hand it back to the
-     host SoC later. */
-  HAL_GPIO_WritePin(FLASH_GPIO_Port, FLASH_Pin, GPIO_PIN_RESET);
-
   /*Configure GPIO pins : PC13 HAPTIC_ENB_Pin IRIS_DIR_Pin FOCUS_DIR_Pin
                            LED_RED_Pin */
   GPIO_InitStruct.Pin = GPIO_PIN_13|HAPTIC_ENB_Pin|IRIS_DIR_Pin|FOCUS_DIR_Pin
@@ -114,16 +107,12 @@ void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : FLASH_Pin
-     Output, not input. See the ODR write above: this net sets the low level
-     of both IR_CTRL inverters, and left floating the IR gating does nothing
-     repeatable. This assumes the host SoC leaves its end of FLASH
-     high-impedance - it is a shared net on the sheet 3 board-to-board
-     connector. IR_LED_SetFlashSource(IR_FLASH_SRC_HOST) returns it to an
-     input when the host is meant to drive the strobe instead. */
+     INPUT ONLY - never drive PC3 (pin 11). The sensor's FLASH signal is
+     wired to it. Analog mode, because ADC1 reads it (FLASH sync) and its
+     ~2.3V high sits at the digital VIH threshold. */
   GPIO_InitStruct.Pin = FLASH_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(FLASH_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : SN0_VS_Pin (sensor XVS, frame start -> IR_LED_OnVSync) */
