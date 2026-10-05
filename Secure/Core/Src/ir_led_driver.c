@@ -61,6 +61,12 @@ static uint32_t          s_gate_period_ticks = 0U;
 static uint32_t          s_fp_width_us   = 0U;
 static volatile uint32_t s_fp_count      = 0U;
 static volatile uint32_t s_last_vsync_ms = 0U;
+/* Strobe: channels whose DAC_DIMx is switched with FLASH (setpoint while
+   FLASH is low, 0 V while high). Bit n = channel n. */
+static volatile uint32_t s_dac_gate      = 0U;
+/* DAC test: DAC_DIMx held at a raw voltage that bypasses the current cap.
+   Ended by any setpoint write (SetCurrentRaw) or IR_LED_ClearDacTest(). */
+static bool              s_dactest[2]    = {false, false};
 static volatile bool     s_vsync_seen    = false;
 static volatile bool     s_fp_synced     = false;
 
@@ -336,12 +342,20 @@ void IR_LED_SetCurrentRaw(IR_Channel_t ch, uint16_t code_12bit)
 {
     if (ch >= IR_CH_COUNT) return;
     if (code_12bit > DAC1_CODE_MAX) code_12bit = DAC1_CODE_MAX;
+    s_dactest[ch] = false;                 /* a real setpoint ends any DAC test */
 
     /* Hard cap. Every DAC write - mA, mV, raw code, ramp, DAC PWM - goes
        through raw_code, which is only ever set here. */
     if (code_12bit > hard_limit_code()) code_12bit = hard_limit_code();
 
     s_ch[ch].raw_code = code_12bit;
+    /* Strobe: outside the exposure (FLASH high) the DAC stays at 0 V; the
+       new setpoint is applied at the next FLASH falling edge. */
+    if ((s_dac_gate & (1UL << ch)) != 0U &&
+        HAL_GPIO_ReadPin(FLASH_GPIO_Port, FLASH_Pin) == GPIO_PIN_SET) {
+        DAC1_SetValue(s_ch[ch].dac_channel, 0U);
+        return;
+    }
     DAC1_SetValue(s_ch[ch].dac_channel, code_12bit);
 }
 
@@ -512,8 +526,68 @@ void IR_LED_Init(void)
     IR_LED_SetCurrent_mA(IR_CH0, IR_BOOT_CURRENT_MA);
 }
 
+/* Non-blocking current ramp, stepped from IR_LED_Task() once per tick. */
+static struct {
+    bool     active;
+    uint32_t from_ma, to_ma, t0_ms, dur_ms, last_ma;
+} s_ramp[IR_CH_COUNT];
+
+bool IR_LED_StartRamp_mA(IR_Channel_t ch, uint32_t target_ma, uint32_t time_ms)
+{
+    if (ch >= IR_CH_COUNT) return false;
+    if (target_ma > s_limit_ma) target_ma = s_limit_ma;
+    s_ramp[ch].active  = false;
+    if (time_ms == 0U) {
+        IR_LED_SetCurrent_mA(ch, target_ma);
+        return true;
+    }
+    s_ramp[ch].from_ma = IR_LED_GetCurrent_mA(ch);
+    s_ramp[ch].last_ma = s_ramp[ch].from_ma;
+    s_ramp[ch].to_ma   = target_ma;
+    s_ramp[ch].dur_ms  = time_ms;
+    s_ramp[ch].t0_ms   = HAL_GetTick();
+    s_ramp[ch].active  = true;
+    return true;
+}
+
+void IR_LED_StopRamp(IR_Channel_t ch)
+{
+    if (ch < IR_CH_COUNT) s_ramp[ch].active = false;
+}
+
+bool IR_LED_GetRamp(IR_Channel_t ch, uint32_t *to_ma, uint32_t *left_ms)
+{
+    if (ch >= IR_CH_COUNT || !s_ramp[ch].active) return false;
+    uint32_t el = HAL_GetTick() - s_ramp[ch].t0_ms;
+    if (to_ma)   *to_ma   = s_ramp[ch].to_ma;
+    if (left_ms) *left_ms = (el < s_ramp[ch].dur_ms) ? s_ramp[ch].dur_ms - el : 0U;
+    return true;
+}
+
+static void ramp_task(void)
+{
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        if (!s_ramp[i].active) continue;
+        uint32_t el = HAL_GetTick() - s_ramp[i].t0_ms;
+        uint32_t ma;
+        if (el >= s_ramp[i].dur_ms) {
+            ma = s_ramp[i].to_ma;
+            s_ramp[i].active = false;
+        } else if (s_ramp[i].to_ma >= s_ramp[i].from_ma) {
+            ma = s_ramp[i].from_ma + (uint32_t)(((uint64_t)(s_ramp[i].to_ma - s_ramp[i].from_ma) * el) / s_ramp[i].dur_ms);
+        } else {
+            ma = s_ramp[i].from_ma - (uint32_t)(((uint64_t)(s_ramp[i].from_ma - s_ramp[i].to_ma) * el) / s_ramp[i].dur_ms);
+        }
+        if (ma != s_ramp[i].last_ma || !s_ramp[i].active) {
+            IR_LED_SetCurrent_mA((IR_Channel_t)i, ma);
+            s_ramp[i].last_ma = ma;
+        }
+    }
+}
+
 void IR_LED_Task(void)
 {
+    ramp_task();
     fs_task();
 
     for (int i = 0; i < IR_CH_COUNT; i++) {
@@ -1401,11 +1475,36 @@ static volatile uint32_t s_fl_period_cyc   = 0U;   /* fall to fall */
 static volatile uint32_t s_fl_low_cyc      = 0U;   /* fall to rise */
 static volatile uint32_t s_fl_last_edge_ms = 0U;
 
+/* Sensor sync monitor (rising edges of SN0_VS on PC4 and SN0_HS on PB1, both
+   1.8V from the sensor, read as digital inputs). */
+static volatile uint32_t s_vs_count = 0U, s_vs_last = 0U, s_vs_period_cyc = 0U;
+static volatile uint32_t s_hs_count = 0U, s_hs_last = 0U, s_hs_period_cyc = 0U;
+static volatile uint32_t s_hs_at_vs = 0U, s_hs_per_frame = 0U, s_vs_last_ms = 0U, s_hs_count_seen = 0U;
+
+/* FLASH gate: PWM_DIM0 follows FLASH (LOW while FLASH is low, i.e. during
+   the exposure), driven from the PC3 edge interrupts. */
+/* Bit per channel; both PWM_DIM pins are on GPIOB, so one BSRR write
+   switches every gated channel at the same instant. */
+#define GATE_PIN(ch)  ((ch) == IR_CH0 ? PWM_DIM0_Pin : PWM_DIM1_Pin)
+static volatile uint32_t s_gate_pins      = (IR_FLASH_GATE_AT_BOOT != 0) ? PWM_DIM0_Pin : 0U;
+static volatile uint32_t s_gate_count     = 0U;
+static volatile uint32_t s_low_pins       = 0U;   /* PWM_DIMx held LOW by "pwm low" */
+static volatile uint32_t s_gate_inv_pins  = 0U;   /* gated channels with inverted polarity:
+                                                     HIGH while FLASH is low, LOW while high */
+static uint32_t          s_pwm_duty_req[IR_CH_COUNT] = {0U, 0U};   /* requested duty % */
+
 /* The STM32H5 HAL dispatches EXTI through these two callbacks, never through
    HAL_GPIO_EXTI_Callback() below - so only FLASH is handled here. */
 void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin != FLASH_Pin) return;
+    if (s_dac_gate & 1U) DAC1->DHR12R1 = s_ch[IR_CH0].raw_code;   /* strobe: current up */
+    if (s_dac_gate & 2U) DAC1->DHR12R2 = s_ch[IR_CH1].raw_code;
+    if (s_gate_pins != 0U) {                 /* exposure starts */
+        uint32_t inv = s_gate_inv_pins, norm = s_gate_pins & ~inv;
+        PWM_DIM0_GPIO_Port->BSRR = (norm << 16U) | inv;   /* normal LOW, inverted HIGH */
+        s_gate_count++;
+    }
     uint32_t now = DWT->CYCCNT;
     if (s_fl_falls != 0U) s_fl_period_cyc = now - s_fl_last_fall;
     s_fl_last_fall    = now;
@@ -1415,9 +1514,232 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
+    if (GPIO_Pin == SN0_HS_Pin) {          /* ~65-130 kHz: keep this short */
+        uint32_t now = DWT->CYCCNT;
+        s_hs_period_cyc = now - s_hs_last;
+        s_hs_last = now;
+        s_hs_count++;
+        return;
+    }
+    if (GPIO_Pin == SN0_VS_Pin) {
+        uint32_t now = DWT->CYCCNT;
+        if (s_vs_count != 0U) {
+            s_vs_period_cyc = now - s_vs_last;
+            s_hs_per_frame  = s_hs_count - s_hs_at_vs;
+        }
+        s_vs_last  = now;
+        s_hs_at_vs = s_hs_count;
+        s_vs_count++;
+        s_vs_last_ms = HAL_GetTick();
+        return;
+    }
     if (GPIO_Pin != FLASH_Pin) return;
+    if (s_gate_pins != 0U) {                 /* exposure ends */
+        uint32_t inv = s_gate_inv_pins, norm = s_gate_pins & ~inv;
+        PWM_DIM0_GPIO_Port->BSRR = norm | (inv << 16U);   /* normal HIGH, inverted LOW */
+    }
+    if (s_dac_gate & 1U) DAC1->DHR12R1 = 0U;                     /* strobe: current to 0 */
+    if (s_dac_gate & 2U) DAC1->DHR12R2 = 0U;
     if (s_fl_falls != 0U) s_fl_low_cyc = DWT->CYCCNT - s_fl_last_fall;
     s_fl_last_edge_ms = HAL_GetTick();
+}
+
+/* True while the other channel can hold its PWM_DIM LOW (fixed LOW or PWM). */
+static bool other_can_be_low(IR_Channel_t ch)
+{
+    IR_Channel_t o = (ch == IR_CH0) ? IR_CH1 : IR_CH0;
+    return ((s_low_pins & GATE_PIN(o)) != 0U) || (s_ch[o].mode == IR_MODE_GATE_PWM);
+}
+
+/* Ends strobe on a channel: DAC back to its steady setpoint. */
+static void strobe_clear(IR_Channel_t ch)
+{
+    s_gate_inv_pins &= ~GATE_PIN(ch);      /* any mode change ends an inverted gate too */
+    if ((s_dac_gate & (1UL << ch)) == 0U) return;
+    s_dac_gate &= ~(1UL << ch);
+    DAC1_SetValue(s_ch[ch].dac_channel, s_ch[ch].raw_code);
+}
+
+/* Takes the pin back from TIM12 (if a duty-cycle PWM was running) so the
+   BSRR writes below drive it; leaves it HIGH. Also ends strobe. */
+static void pwm_release(IR_Channel_t ch)
+{
+    strobe_clear(ch);
+    if (s_ch[ch].mode != IR_MODE_OFF) (void)IR_LED_SetMode(ch, IR_MODE_OFF);
+}
+
+bool IR_LED_SetFlashGate(IR_Channel_t ch, bool on)
+{
+    uint32_t pin = GATE_PIN(ch);
+
+    if (ch >= IR_CH_COUNT) return false;
+    if (on && ((s_gate_pins & ~pin) != 0U || other_can_be_low(ch))) {
+        return false;                        /* check before touching the pin */
+    }
+    pwm_release(ch);
+    if (!on) {
+        s_gate_pins &= ~pin;
+        s_low_pins  &= ~pin;
+        PWM_DIM0_GPIO_Port->BSRR = pin;                    /* HIGH: LED follows FLASH only */
+        return true;
+    }
+    /* Only one channel may be gated. FLASH's high level comes only from the
+       IR_CTRLx pull-ups through Q2/Q3, i.e. from a channel whose PWM_DIMx is
+       HIGH. With both gated, nothing pulls FLASH up when the sensor releases
+       it after the exposure, so FLASH stays low and the gate never releases
+       (seen on the bench 2026-10-02: both LEDs latched on). */
+    s_low_pins  &= ~pin;
+    s_gate_pins |= pin;
+    if (HAL_GPIO_ReadPin(FLASH_GPIO_Port, FLASH_Pin) == GPIO_PIN_RESET) {
+        PWM_DIM0_GPIO_Port->BSRR = pin << 16U;             /* in exposure now */
+    }
+    return true;
+}
+
+bool IR_LED_SetPwmLevel(IR_Channel_t ch, bool high)
+{
+    uint32_t pin = GATE_PIN(ch);
+
+    if (ch >= IR_CH_COUNT) return false;
+    if (!high && (s_gate_pins & ~pin) != 0U) return false;
+    pwm_release(ch);
+    if (high) {
+        s_gate_pins &= ~pin;
+        s_low_pins  &= ~pin;
+        PWM_DIM0_GPIO_Port->BSRR = pin;
+        return true;
+    }
+    /* LOW is refused (above) while the other channel is gated: it would leave
+       no PWM_DIMx HIGH to pull FLASH up after the exposure (gate latch-up). */
+    s_gate_pins &= ~pin;
+    s_low_pins  |= pin;
+    PWM_DIM0_GPIO_Port->BSRR = pin << 16U;
+    return true;
+}
+
+uint32_t IR_LED_SetDacTest_mV(IR_Channel_t ch, uint32_t millivolts)
+{
+    uint32_t code;
+
+    if (ch >= IR_CH_COUNT) return 0U;
+    if (millivolts > IR_DACTEST_MAX_MV) millivolts = IR_DACTEST_MAX_MV;
+    IR_LED_StopRamp(ch);
+    if (IR_LED_GetStrobe(ch)) (void)IR_LED_SetStrobe(ch, false);   /* ISR would overwrite the DAC */
+    (void)IR_LED_SetDacPwm(ch, IR_DAC_PWM_MIN_HZ, 100U);            /* no DAC chop */
+    code = (millivolts * DAC1_CODE_MAX + IR_DAC_VREF_MV / 2U) / IR_DAC_VREF_MV;
+    if (code > DAC1_CODE_MAX) code = DAC1_CODE_MAX;
+    DAC1_SetValue(s_ch[ch].dac_channel, (uint16_t)code);           /* bypasses raw_code / cap */
+    s_dactest[ch] = true;
+    return (code * IR_DAC_VREF_MV + DAC1_CODE_MAX / 2U) / DAC1_CODE_MAX;
+}
+
+void IR_LED_ClearDacTest(IR_Channel_t ch)
+{
+    if (ch >= IR_CH_COUNT || !s_dactest[ch]) return;
+    IR_LED_SetCurrentRaw(ch, s_ch[ch].raw_code);   /* back to the capped setpoint */
+}
+
+bool IR_LED_GetDacTest(IR_Channel_t ch, uint32_t *millivolts)
+{
+    if (ch >= IR_CH_COUNT || !s_dactest[ch]) return false;
+    if (millivolts) {
+        uint32_t code = DAC1_GetValue(s_ch[ch].dac_channel);
+        *millivolts = (code * IR_DAC_VREF_MV + DAC1_CODE_MAX / 2U) / DAC1_CODE_MAX;
+    }
+    return true;
+}
+
+bool IR_LED_SetStrobe(IR_Channel_t ch, bool on)
+{
+    if (ch >= IR_CH_COUNT) return false;
+    if (!on) {
+        return IR_LED_SetFlashGate(ch, false);     /* clears strobe, PWM_DIM HIGH */
+    }
+    if (!IR_LED_SetFlashGate(ch, true)) return false;
+    (void)IR_LED_SetDacPwm(ch, IR_DAC_PWM_MIN_HZ, 100U);   /* no DAC chop */
+    s_dac_gate |= (1UL << ch);
+    IR_LED_SetCurrentRaw(ch, s_ch[ch].raw_code);   /* 0 V now if outside exposure */
+    return true;
+}
+
+bool IR_LED_GetStrobe(IR_Channel_t ch)
+{
+    return (ch < IR_CH_COUNT) && ((s_dac_gate & (1UL << ch)) != 0U);
+}
+
+bool IR_LED_SetPwmDuty(IR_Channel_t ch, uint32_t freq_hz, uint32_t duty_pct)
+{
+    IR_Channel_t o = (ch == IR_CH0) ? IR_CH1 : IR_CH0;
+    uint32_t pin = GATE_PIN(ch), ofreq, oduty;
+
+    if (ch >= IR_CH_COUNT) return false;
+    if (duty_pct == 0U)   return IR_LED_SetPwmLevel(ch, true);
+    if (duty_pct >= 100U) return IR_LED_SetPwmLevel(ch, false);
+    if ((s_gate_pins & ~pin) != 0U) return false;      /* other gated: latch-up */
+
+    strobe_clear(ch);
+    s_gate_pins &= ~pin;
+    s_low_pins  &= ~pin;
+    (void)IR_LED_SetGatePwm(ch, freq_hz, duty_pct);
+    /* TIM12 is shared: re-apply the other channel at the new period with
+       its own duty, or its duty would drift with the new ARR. */
+    if (s_ch[o].mode == IR_MODE_GATE_PWM && IR_LED_GetGatePwm(o, &ofreq, &oduty)) {
+        (void)IR_LED_SetGatePwm(o, freq_hz, s_pwm_duty_req[o]);
+    }
+    s_pwm_duty_req[ch] = duty_pct;
+    return true;
+}
+
+IR_PwmState_t IR_LED_GetPwmState(IR_Channel_t ch)
+{
+    uint32_t pin = GATE_PIN(ch);
+    if (ch >= IR_CH_COUNT)    return IR_PWM_HIGH;
+    if (s_ch[ch].mode == IR_MODE_GATE_PWM) return IR_PWM_DUTY;
+    if (s_gate_pins & pin)    return IR_PWM_GATED;
+    if (s_low_pins & pin)     return IR_PWM_LOW;
+    return IR_PWM_HIGH;
+}
+
+bool IR_LED_SetFlashGateInverted(IR_Channel_t ch)
+{
+    uint32_t pin = GATE_PIN(ch);
+
+    if (!IR_LED_SetFlashGate(ch, true)) return false;   /* same one-gate rule */
+    s_gate_inv_pins |= pin;
+    /* Apply the inverted level for the current FLASH state now. */
+    if (HAL_GPIO_ReadPin(FLASH_GPIO_Port, FLASH_Pin) == GPIO_PIN_RESET) {
+        PWM_DIM0_GPIO_Port->BSRR = pin;              /* FLASH low  -> HIGH */
+    } else {
+        PWM_DIM0_GPIO_Port->BSRR = pin << 16U;       /* FLASH high -> LOW  */
+    }
+    return true;
+}
+
+bool IR_LED_GetFlashGateInverted(IR_Channel_t ch)
+{
+    return (ch < IR_CH_COUNT) && ((s_gate_inv_pins & GATE_PIN(ch)) != 0U);
+}
+
+bool IR_LED_GetFlashGate(IR_Channel_t ch, uint32_t *count)
+{
+    if (count) *count = s_gate_count;
+    return (ch < IR_CH_COUNT) && ((s_gate_pins & GATE_PIN(ch)) != 0U);
+}
+
+void IR_LED_GetSyncInput(IR_SyncInput_t *in)
+{
+    uint32_t cyc_per_us = SystemCoreClock / 1000000U;
+    uint32_t now_ms = HAL_GetTick();
+
+    in->vs_count       = s_vs_count;
+    in->vs_period_us   = s_vs_period_cyc / cyc_per_us;
+    in->vs_active      = (s_vs_count != 0U) && ((now_ms - s_vs_last_ms) < IR_FLASH_IDLE_MS);
+    in->hs_count       = s_hs_count;
+    in->hs_period_ns   = (uint32_t)(((uint64_t)s_hs_period_cyc * 1000U) / cyc_per_us);
+    in->hs_per_frame   = s_hs_per_frame;
+    /* HS alive if its count moved since the last call */
+    in->hs_active      = (s_hs_count != s_hs_count_seen);
+    s_hs_count_seen    = s_hs_count;
 }
 
 void IR_LED_GetFlashInput(IR_FlashInput_t *in)

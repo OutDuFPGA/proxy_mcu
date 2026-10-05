@@ -9,28 +9,34 @@ sheet 3, LT3763 datasheet Rev C. Firmware: `Secure/Core/Src/ir_led_driver.c`,
 
 ---
 
-## Current operating mode (2026-10-01)
+## Current operating mode (2026-10-05)
 
-**The sensor's FLASH signal switches the LED; the MCU only sets the current.**
-
-- `PWM_DIM0` and `PWM_DIM1` are held **HIGH** permanently. With `PWM_DIMx`
-  high, Q2/Q3 pass the FLASH net straight to `IR_CTRLx`, so the LED is on for
-  exactly the FLASH (TOUT0) pulse width.
-- `FLASH` (PC3, pin 11) is an input only; the MCU never drives it. `flash`
-  mode (ADC1 on PC3) is blocked (`IR_FLASH_SYNC_ENABLE` = 0).
-- The current is set through `DAC_DIM0` (LT3763 CTRL1). Boot value is
-  `IR_BOOT_CURRENT_MA` (1000 mA).
-- Only CH0 has an LED driver fitted. CH1's DAC stays at 0.
-- `FAULT0` reads low even while the LED is lit (the LT3763 also flags FB
-  outside 0.25-1.16 V), so it is shown in `ir status` but not acted on.
-
-The console has only these IR commands:
+FLASH (PC3, pin 11) is a read-only input from the sensor, active low (low =
+exposure). Boot: CH0 FLASH-gated at 1000 mA, CH1 PWM_DIM1 HIGH at 0 mA.
 
 ```
-ir status          PWM_DIM0, DAC_DIM0 and FAULT0 state
-ir ma <mA>         LED current via DAC_DIM0 (clamped to the 3000 mA limit)
-ir mv <mV>         DAC_DIM0 voltage directly
+ir status                          FLASH, VSYNC/HSYNC inputs and both channels
+ir [ch0|ch1] ma <mA>               LED current via DAC_DIMx (up to 4000 mA)
+ir [ch0|ch1] mv <mV>               DAC_DIMx voltage directly
+ir [ch0|ch1] strobe on|off         lit while FLASH low (PWM_DIM LOW + DAC setpoint),
+                                   DAC 0 V while FLASH high
+ir [ch0|ch1] gate on|off           PWM_DIMx LOW while FLASH low / fixed HIGH
+ir [ch0|ch1] gate inv              PWM_DIMx HIGH while FLASH low (LED off in exposure)
+ir [ch0|ch1] pwm high|low          PWM_DIMx fixed HIGH / LOW (LED forced on)
+ir [ch0|ch1] pwm <hz> <duty%>      PWM on PWM_DIMx (TIM12, shared frequency)
+ir [ch0|ch1] ramp <mA> <ms>        gradual current change (non-blocking)
+ir [ch0|ch1] dacpwm <hz> <duty%>|off  chop DAC_DIMx between 0 V and the setpoint
+ir [ch0|ch1] dactest <mV>|off      DAC bench test up to 1500 mV, BYPASSES the cap
 ```
+
+PWM_DIMx LOW = LED on (Q2/Q3 invert). Only one channel can be gated/strobed,
+and not while the other is held LOW or in PWM: FLASH is pulled high only
+through a channel whose PWM_DIMx is HIGH. While FLASH is high the LT3763 is
+enabled regardless of PWM_DIMx, so outside the exposure the LED sees CTRL1
+only (0 V in strobe; the DAC runs unbuffered so 0 is a true 0 mV).
+
+The FLASH-synchronised pulse engine (ir enable/pulse, both channels) is on
+branch `ir-pulse-engine`.
 
 Sections 3-11 below describe the earlier firmware and its `ir ch<0|1> ...`
 commands, which have been removed. They are kept for the hardware notes.
@@ -242,11 +248,9 @@ At each stage verify:
 
 Then repeat the whole of sections 5–6 for channel 1 on `J6` / `PE0`.
 
-> Current is **hard-capped at 3000 mA** (`IR_LED_HARD_LIMIT_MA`), enforced on
-> the DAC code itself: `ma`, `mv`, `raw`, `ramp` and DAC PWM all stop at code
-> 273 (220 mV on CTRL1, ~2992 mA), and `ir limit` can lower the cap but not
-> raise it past 3000. Changing it needs a rebuild. With the cap in place, the
-> 4 A steps above clamp to ~3 A.
+> Current is **hard-capped at 4000 mA** (`IR_LED_HARD_LIMIT_MA`, raised from
+> 3000 on 2026-10-02), enforced on the DAC code itself: `ma` and `mv` stop at
+> code 365 (294 mV on CTRL1, ~3998 mA). Changing it needs a rebuild.
 
 ## 7. Fault behaviour
 

@@ -246,7 +246,8 @@ void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI4_IRQn);
   HAL_NVIC_SetPriority(EXTI1_IRQn, 2, 0);   /* SN0_HS, PB1 - per line */
   HAL_NVIC_EnableIRQ(EXTI1_IRQn);
-  HAL_NVIC_SetPriority(EXTI3_IRQn, 3, 0);   /* FLASH, PC3 - input monitor */
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 1, 0);   /* FLASH, PC3 - gates PWM_DIM0; above SN0_HS so the
+                                               132 kHz line interrupt cannot delay the gate */
   HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 
 }

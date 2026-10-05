@@ -20,12 +20,15 @@ void MX_DAC1_Init(void)
        enables first. This also makes the function safe to call twice. */
     DAC1->CR &= ~(DAC_CR_EN1 | DAC_CR_EN2);
 
-    /* MODEx = 000: normal mode, output buffer enabled, connected to the
-       external pin only. The buffer matters here - CTRL1 on the LED board is
-       reached through a connector and ~10cm of harness, and the LT3763's own
-       CTRL1 leakage is only 20nA, so an unbuffered output would be at the
-       mercy of any leakage on that net. */
-    DAC1->MCR &= ~(DAC_MCR_MODE1 | DAC_MCR_MODE2);
+    /* MODEx = 010: normal mode, output buffer DISABLED, connected to the
+       external pin. The buffered output cannot pull below ~20mV (measured
+       20.7mV at code 0 on 2026-10-05), and on this board 1mV of CTRL1 is
+       ~13.6mA of LED current - so "0" still drove ~280mA and the LEDs never
+       went fully off. Unbuffered reaches 0.8mV at code 0 and was accurate at
+       code 92 (74.2mV vs 74.1mV). Its ~15k output impedance against the
+       LT3763's 20nA CTRL1 pin current is a ~0.3mV error. */
+    DAC1->MCR = (DAC1->MCR & ~(DAC_MCR_MODE1 | DAC_MCR_MODE2))
+              | (2UL << DAC_MCR_MODE1_Pos) | (2UL << DAC_MCR_MODE2_Pos);
 
     /* Start both channels at zero so enabling them cannot produce a current
        step on the LED string. */
@@ -36,7 +39,7 @@ void MX_DAC1_Init(void)
        on the next APB cycle rather than waiting for a trigger event. */
     DAC1->CR |= (DAC_CR_EN1 | DAC_CR_EN2);
 
-    /* Buffered channels need tWAKEUP (~8-15us on this part) before the output
+    /* Channels need tWAKEUP (~8-15us on this part) before the output
        is valid. Nothing downstream reads it that fast, but this keeps the
        "DAC is ready" promise of DAC1_IsReady() honest. */
     for (volatile uint32_t i = 0; i < 2000U; i++) {
