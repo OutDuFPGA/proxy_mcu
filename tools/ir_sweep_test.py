@@ -101,9 +101,10 @@ class SwdConsole:
         from pyocd.core.helpers import ConnectHelper
         nm = subprocess.run(["arm-none-eabi-nm", elf], capture_output=True, text=True, check=True).stdout
         self.sym = {l.split()[2]: int(l.split()[0], 16) for l in nm.splitlines() if len(l.split()) == 3}
-        for need in ("cmd_buffer", "cmd_index", "cmd_ready_flag", "s_eng_on", "s_ch"):
+        for need in ("cmd_buffer", "cmd_index", "cmd_ready_flag", "s_ch", "s_fl_falls"):
             if need not in self.sym:
-                raise SystemExit("ELF %s has no %s - is it the pulse-engine build?" % (elf, need))
+                raise SystemExit("ELF %s has no %s - is it the build running on the board?" % (elf, need))
+        self.engine = "s_eng_on" in self.sym     # pulse-engine build vs strobe/gate build
         self.session = ConnectHelper.session_with_chosen_probe(
             target_override=target, options={"connect_mode": "attach"})
         self.session.open()
@@ -129,13 +130,16 @@ class SwdConsole:
         cpu_mhz = 64
         per = r(s["s_fl_period_cyc"]) / (cpu_mhz * 1000.0)
         st = {"source": "swd",
-              "enabled": bool(t.read8(s["s_eng_on"])),
-              "pulse_us": r(s["s_eng_pulse_us"]),
-              "pulses": r(s["s_eng_pulses"]),
               "falls": r(s["s_fl_falls"]),
               "flash_hz": round(1000.0 / per, 3) if per else 0.0,
-              "exposure_us": r(s["s_eng_exp_us"]) or int(r(s["s_fl_low_cyc"]) / cpu_mhz),
-              "release_us": r(s["s_eng_pred_us"])}
+              "exposure_us": int(r(s["s_fl_low_cyc"]) / cpu_mhz)}
+        if self.engine:
+            st.update(enabled=bool(t.read8(s["s_eng_on"])), pulse_us=r(s["s_eng_pulse_us"]),
+                      pulses=r(s["s_eng_pulses"]), exposure_us=r(s["s_eng_exp_us"]) or st["exposure_us"])
+        else:
+            gate, strobe = r(s["s_gate_pins"]), r(s["s_dac_gate"])
+            st.update(enabled=True, pulses=r(s.get("s_gate_count", s["s_fl_falls"])),
+                      ch0_mode=("strobe" if strobe & 1 else "gate" if gate & 0x4000 else "follows FLASH only"))
         for ch in (0, 1):
             code = t.read16(s["s_ch"] + ch * 0x34 + 48)
             st["ch%d" % ch] = {"dac_code": code, "dac_mv": round(code * DAC_VREF_MV / DAC_MAX)}
@@ -175,10 +179,17 @@ def video_stats(path, skip_s=1.0):
                                "format=gray,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
                                "-f", "null", "-"], capture_output=True, text=True).stdout
     y = [float(v) for v in re.findall(r"YAVG=([\d.]+)", luma_txt)]
+    roi_txt = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf",
+                              "crop=iw/2:ih/2:iw/4:ih/4,format=gray,signalstats,"
+                              "metadata=print:key=lavfi.signalstats.YAVG:file=-",
+                              "-f", "null", "-"], capture_output=True, text=True).stdout
+    yc = [float(v) for v in re.findall(r"YAVG=([\d.]+)", roi_txt)]
     ys = y[int(skip_s * 60):] or y
     diff = [abs(b - a) for a, b in zip(ys, ys[1:])]
     mu = statistics.mean(ys) if ys else 0
+    ycs = yc[int(skip_s * 60):] or yc
     return {"frames": len(p),
+            "centre_luma_mean": round(statistics.mean(ycs), 2) if ycs else 0,
             "fps": round((len(q) - 1) / (q[-1] - q[0]), 3) if len(q) > 1 else 0,
             "dropped": sum(1 for x in d if med and x > 1.5 * med),
             "luma_mean": round(mu, 2),
@@ -191,13 +202,15 @@ def video_stats(path, skip_s=1.0):
 
 def annotate(raw, out, level_ma, st, args):
     ch0 = st.get("ch0", {})
-    mode = ("PULSE %d us" % st.get("pulse_us", 0)) if level_ma > PULSE_THRESHOLD_MA else \
-           ("full exposure" if level_ma else "off (0 mA)")
+    if "ch0_mode" in st:
+        mode = "CH0 mode: %s" % st["ch0_mode"]
+    else:
+        mode = ("PULSE %d us" % st.get("pulse_us", 0)) if level_ma > PULSE_THRESHOLD_MA else \
+               ("full exposure" if level_ma else "off (0 mA)")
     l1 = "TEST  IR %s = %d mA   DAC %s mV (code %s)   %s   PWM_DIM synced to FLASH" % (
         args.channel.upper(), level_ma, ch0.get("dac_mv", "?"), ch0.get("dac_code", "?"), mode)
-    l2 = "MCU   FLASH %.2f Hz   exposure %s us   IR %s   pulses %s" % (
-        st.get("flash_hz", 0), st.get("exposure_us", "?"),
-        "ENABLED" if st.get("enabled") else "DISABLED", st.get("pulses", "?"))
+    l2 = "MCU   FLASH %.2f Hz   exposure %s us   gate pulses %s" % (
+        st.get("flash_hz", 0), st.get("exposure_us", "?"), st.get("pulses", "?"))
     l3 = "VIDEO IMX568   %s   frame %%{frame_num}  t=%%{pts\\:hms}  Y=%%{metadata\\:lavfi.signalstats.YAVG}" % \
          datetime.now().strftime("%Y-%m-%d")
     esc = lambda s: s.replace(":", "\\:").replace("'", "")
@@ -228,6 +241,7 @@ def main():
     ap.add_argument("--out", help="output directory")
     ap.add_argument("--final-ma", type=int, default=1000, help="current to leave set at the end")
     ap.add_argument("--no-annotate", action="store_true")
+    ap.add_argument("--mode", choices=["gate", "strobe"], help="strobe/gate build: set ch0 mode first")
     args = ap.parse_args()
 
     out = args.out or os.path.join(os.path.dirname(os.path.dirname(here)), "captures",
@@ -241,9 +255,15 @@ def main():
     results = {"started": datetime.now().isoformat(timespec="seconds"), "rtsp": args.rtsp,
                "channel": args.channel, "duration_s": args.duration, "console": con.name, "levels": []}
     try:
-        if args.pulse:
-            con.command("ir pulse %d" % args.pulse)
-        con.command("ir enable")
+        engine = getattr(con, "engine", True)
+        if engine:
+            if args.pulse:
+                con.command("ir pulse %d" % args.pulse)
+            con.command("ir enable")
+        elif args.mode:
+            con.command("ir ch0 %s on" % args.mode)
+        if not engine and args.channel == "both":
+            prefix = "ch0 "          # strobe/gate build: 'ir ma' addresses ch0 only
         for ma in args.levels:
             print("--- %d mA" % ma)
             con.command("ir %sma %d" % (prefix, ma))
@@ -265,12 +285,33 @@ def main():
                 annotate(raw, ann, ma, st, args)
                 entry["annotated_video"] = os.path.basename(ann)
             results["levels"].append(entry)
-            print("    %.2f fps, %d dropped, luma %.1f (std %.2f, flicker %.2f%%), FLASH %.2f Hz, exposure %s us" % (
-                vs["fps"], vs["dropped"], vs["luma_mean"], vs["luma_std"], vs["flicker_pct"],
+            print("    %.2f fps, %d dropped, luma %.1f centre %.1f (std %.2f, flicker %.2f%%), FLASH %.2f Hz, exposure %s us" % (
+                vs["fps"], vs["dropped"], vs["luma_mean"], vs["centre_luma_mean"], vs["luma_std"], vs["flicker_pct"],
                 st.get("flash_hz", 0), st.get("exposure_us", "?")))
         con.command("ir %sma %d" % (prefix, args.final_ma))
     finally:
         con.close()
+
+    # Side-by-side stills and amplified differences against the first level
+    stills = []
+    for e in results["levels"]:
+        png = os.path.join(out, "still_%04dmA.png" % e["level_ma"])
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(args.duration / 2), "-i",
+                        os.path.join(out, e["raw_video"]), "-frames:v", "1", "-vf", "scale=608:-1", png])
+        stills.append((e["level_ma"], png))
+    if stills:
+        base = stills[0][1]
+        for ma, png in stills[1:]:
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", png, "-i", base, "-filter_complex",
+                            "[0:v][1:v]blend=all_mode=difference,lutyuv=y=val*6,format=gray",
+                            os.path.join(out, "diff_%04dmA_vs_%04dmA_x6.png" % (ma, stills[0][0]))])
+        lab = ["[%d:v]drawtext=fontfile=%s:fontsize=28:fontcolor=yellow:box=1:boxcolor=black@0.6:x=10:y=10:"
+               "text='%d mA  Y=%.1f'[v%d]" % (i, FONT, ma, e["video"]["luma_mean"], i)
+               for i, ((ma, _), e) in enumerate(zip(stills, results["levels"]))]
+        ins = sum([["-i", png] for _, png in stills], [])
+        subprocess.run(["ffmpeg", "-v", "error", "-y"] + ins + ["-filter_complex",
+                        ";".join(lab) + ";" + "".join("[v%d]" % i for i in range(len(stills))) +
+                        "hstack=inputs=%d" % len(stills), os.path.join(out, "comparison_stills.png")])
 
     with open(os.path.join(out, "results.json"), "w") as f:
         json.dump(results, f, indent=1)
@@ -278,14 +319,18 @@ def main():
         f.write("# IR LED current sweep - %s\n\n" % results["started"])
         f.write("Channel: %s, %g s per level, MCU via %s, stream %s\n\n" % (
             args.channel, args.duration, con.name, args.rtsp))
-        f.write("| Current | Mode | DAC mV | FLASH Hz | Exposure us | Video fps | Dropped | Luma mean | Luma std | Flicker %% | Video |\n")
-        f.write("|---|---|---|---|---|---|---|---|---|---|---|\n")
+        f.write("| Current | Mode | DAC mV | FLASH Hz | Exposure us | Video fps | Dropped | Luma mean | vs first | Centre luma | vs first | Luma std | Flicker % | Video |\n")
+        f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+        b0 = results["levels"][0]["video"] if results["levels"] else {}
         for e in results["levels"]:
             v, m = e["video"], e["mcu"]
-            f.write("| %d mA | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n" % (
-                e["level_ma"], e["mode"], m.get("ch0", {}).get("dac_mv", "?"), m.get("flash_hz", "?"),
-                m.get("exposure_us", "?"), v["fps"], v["dropped"], v["luma_mean"], v["luma_std"],
+            f.write("| %d mA | %s | %s | %s | %s | %s | %s | %s | %+.1f | %s | %+.1f | %s | %s | %s |\n" % (
+                e["level_ma"], m.get("ch0_mode", e["mode"]), m.get("ch0", {}).get("dac_mv", "?"),
+                m.get("flash_hz", "?"), m.get("exposure_us", "?"), v["fps"], v["dropped"],
+                v["luma_mean"], v["luma_mean"] - b0.get("luma_mean", 0), v["centre_luma_mean"],
+                v["centre_luma_mean"] - b0.get("centre_luma_mean", 0), v["luma_std"],
                 v["flicker_pct"], e.get("annotated_video", e["raw_video"])))
+        f.write("\nStills: comparison_stills.png; differences vs the first level (x6): diff_*.png\n")
     print("done: %s" % out)
 
 

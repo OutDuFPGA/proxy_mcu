@@ -25,6 +25,9 @@ static void print_help(IR_LED_CLI_PrintFn p)
     p("  ir [ch0|ch1] ramp <mA> <ms>  - Change current gradually to <mA> over <ms> (non-blocking)\r\n");
     p("  ir [ch0|ch1] dacpwm <hz> <duty%>|off - Chop DAC_DIMx between 0 V and the setpoint\r\n");
     p("  ir [ch0|ch1] dactest <0..1500 mV>|off - DAC test, BYPASSES the 4 A cap (unplug J5/J6!)\r\n");
+    p("  ir cut day|night        - pulse the IR-cut filter in (day) / out (night): PA11 EN, PA12 PH\r\n");
+    p("  ir cut ms <10..1000>    - IR-cut pulse length (default 150 ms)\r\n");
+    p("  ir cut swap             - swap PH polarity if day/night come out reversed\r\n");
     p("  ir [ch0|ch1] pwm high   - PWM_DIMx fixed HIGH (LED follows FLASH only)\r\n");
     p("  ir [ch0|ch1] pwm low    - PWM_DIMx fixed LOW (LED forced on)\r\n");
     p("  ir [ch0|ch1] pwm <hz> <duty%> - PWM on PWM_DIMx, duty = LED-on share (10..20000 Hz, shared freq)\r\n");
@@ -85,6 +88,15 @@ static void print_status(IR_LED_CLI_PrintFn p)
         snprintf(l, sizeof(l), "SN0_HS (PB1 in):  NOT toggling (count %lu)\r\n", (unsigned long)sy.hs_count);
     }
     p(l);
+
+    {
+        int last; uint32_t cms, nph; bool busy;
+        IR_LED_IrCutStatus(&last, &cms, &nph, &busy);
+        snprintf(l, sizeof(l), "IR-cut (PA11 EN / PA12 PH): last %s, pulse %lu ms, night PH=%lu%s\r\n",
+                 last < 0 ? "none since boot" : (last ? "NIGHT (filter out)" : "DAY (filter in)"),
+                 (unsigned long)cms, (unsigned long)nph, busy ? ", PULSING now" : "");
+        p(l);
+    }
 
     for (int i = 0; i < IR_CH_COUNT; i++) {
         IR_Channel_t ch = (IR_Channel_t)i;
@@ -153,6 +165,37 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
 
     if (rest[0] == '\0' || strcmp(rest, "help") == 0) { print_help(print_fn);   return true; }
     if (strcmp(rest, "status") == 0)                  { print_status(print_fn); return true; }
+
+    if (strcmp(rest, "cut day") == 0 || strcmp(rest, "cut night") == 0) {
+        bool night = (rest[4] == 'n');
+        if (!IR_LED_IrCut(night)) { print_fn("ERROR: IR-cut pulse already running, try again\r\n"); return true; }
+        int last; uint32_t cms, nph; bool busy;
+        IR_LED_IrCutStatus(&last, &cms, &nph, &busy);
+        snprintf(line, sizeof(line), "SUCCESS: IR-cut %s - EN pulsed %lu ms, PH=%lu\r\n",
+                 night ? "NIGHT (filter out)" : "DAY (filter in)", (unsigned long)cms,
+                 (unsigned long)(night ? nph : 1U - nph));
+        print_fn(line);
+        return true;
+    }
+    if (strncmp(rest, "cut ms ", 7) == 0) {
+        long ms = strtol(rest + 7, NULL, 10);
+        if (ms < (long)IR_CUT_PULSE_MIN_MS || ms > (long)IR_CUT_PULSE_MAX_MS) {
+            snprintf(line, sizeof(line), "ERROR: IR-cut pulse must be %lu..%lu ms\r\n",
+                     (unsigned long)IR_CUT_PULSE_MIN_MS, (unsigned long)IR_CUT_PULSE_MAX_MS);
+            print_fn(line); return true;
+        }
+        snprintf(line, sizeof(line), "SUCCESS: IR-cut pulse %lu ms\r\n", (unsigned long)IR_LED_IrCutSetPulse_ms((uint32_t)ms));
+        print_fn(line);
+        return true;
+    }
+    if (strcmp(rest, "cut swap") == 0) {
+        IR_LED_IrCutSwap();
+        uint32_t nph; IR_LED_IrCutStatus(NULL, NULL, &nph, NULL);
+        snprintf(line, sizeof(line), "SUCCESS: IR-cut polarity swapped - night now PH=%lu, day PH=%lu\r\n",
+                 (unsigned long)nph, (unsigned long)(1U - nph));
+        print_fn(line);
+        return true;
+    }
 
     /* Optional channel prefix; without one, commands address CH0. */
     IR_Channel_t ch = IR_CH0;

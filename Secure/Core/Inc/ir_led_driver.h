@@ -54,8 +54,8 @@
   * Note the reset hazard this creates. Out of reset, before MX_GPIO_Init()
   * runs, PB14/PB15 are inputs, so Q is off and IR_CTRLx is pulled to 3V3 --
   * the LEDs are commanded ON. MX_GPIO_Init() therefore writes PWM_DIM0/1
-  * HIGH before switching them to outputs, and IR_ENB_MCU (the 18V rail
-  * request to the PDU) stays low until the application explicitly enables it.
+  * HIGH before switching them to outputs. IR_ENB_MCU/IR_FBC_MCU (PA11/PA12)
+  * are the IR-cut filter's DRV8210 EN/PH and stay low except during a pulse.
   *
   * ---------------------------------------------------------------------------
   * 2. CURRENT CONTROL, AND THE FIXED CTRL2 CEILING
@@ -116,8 +116,8 @@
   * reported by IR_LED_GetCurrent_mA() is open loop. Likewise the LED board
   * has no enable input: its EN/UVLO is a divider off VIN (R9 374k / R7 124k,
   * rising threshold ~6.85V), so it powers up whenever the 18V rail is up.
-  * IR_ENB_MCU (PA11) goes to the host/PDU connector on sheet 3, not to J5/J6,
-  * and is treated here as the request for that rail.
+  * IR_ENB_MCU (PA11) and IR_FBC_MCU (PA12) control the IR-cut filter
+  * (DRV8210 EN/PH, user-confirmed 2026-10-05) - NOT an 18V rail request.
   ******************************************************************************
   */
 #ifndef __IR_LED_DRIVER_H__
@@ -327,10 +327,8 @@ void IR_LED_Task(void);
 /* Software output interlock. Forces both gates off while disabled and
    restores each channel's configured mode when re-enabled.
 
-   NOTE: this is SOFTWARE ONLY. IR_ENB_MCU (PA11) is left unconnected on this
-   build - it reaches the sheet 3 board-to-board header and nothing consumes
-   it - so it controls no rail. The pin is still driven in step with this
-   flag in case it is ever wired, but nothing depends on it.
+   NOTE: this is SOFTWARE ONLY. It does not touch IR_ENB_MCU (PA11), which
+   is the IR-cut filter's DRV8210 EN and must only be pulsed (IR_LED_IrCut).
 
    It defaults to ENABLED at init, so a channel lights as soon as its mode is
    set; there is no separate "enable" step to forget. It is kept because a
@@ -631,6 +629,21 @@ bool IR_LED_GetFlashGate(IR_Channel_t ch, uint32_t *count);
    so the LED is OFF during the exposure and ON outside it - the opposite of
    the normal gate. For testing the board's gate polarity. */
 bool IR_LED_SetFlashGateInverted(IR_Channel_t ch);
+
+/* IR-cut filter on PA11 (IR_ENB_MCU -> DRV8210 IN2/EN) and PA12
+   (IR_FBC_MCU -> IN1/PH). A call pulses EN for the set time with PH chosen
+   for day (filter in) or night (filter out); IR_LED_Task() ends the pulse.
+   Which PH pulls the filter out depends on the coil wiring: IR_CUT_NIGHT_PH
+   is the KL730 ircut.sh guess (0), swappable at runtime. Returns false if a
+   pulse is already running. */
+#define IR_CUT_PULSE_MS             150U
+#define IR_CUT_PULSE_MIN_MS         10U
+#define IR_CUT_PULSE_MAX_MS         1000U
+#define IR_CUT_NIGHT_PH             0U
+bool     IR_LED_IrCut(bool night);
+uint32_t IR_LED_IrCutSetPulse_ms(uint32_t ms);
+void     IR_LED_IrCutSwap(void);
+void     IR_LED_IrCutStatus(int *last, uint32_t *pulse_ms, uint32_t *night_ph, bool *busy);
 
 bool IR_LED_GetFlashGateInverted(IR_Channel_t ch);
 IR_FlashSource_t IR_LED_GetFlashSource(void);

@@ -485,16 +485,12 @@ void IR_LED_Init(void)
         gate_set((IR_Channel_t)i, false);
     }
 
-    /* Output enable starts ON. IR_ENB_MCU (PA11) is not connected to
-       anything on this build - it lands on the sheet 3 board-to-board header
-       and nothing downstream consumes it - so gating illumination on it only
-       ever produced the trap of "mode and current are set but the channel is
-       dark". Illumination is now determined by the per-channel mode alone.
-       The board still comes up dark because every mode is IR_MODE_OFF above.
-       The pin is still driven in step with this flag: it costs nothing and
-       keeps the signal correct if it is ever wired up. */
+    /* Output enable starts ON (software flag only). PA11 is NOT touched
+       here: IR_ENB_MCU/IR_FBC_MCU (PA11/PA12) drive the IR-cut filter's
+       DRV8210 (EN/PH) and must only ever be pulsed - see IR_LED_IrCut(). */
     s_master_enable = true;
-    HAL_GPIO_WritePin(IR_ENB_MCU_GPIO_Port, IR_ENB_MCU_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(IR_ENB_MCU_GPIO_Port, IR_ENB_MCU_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IR_FBC_MCU_GPIO_Port, IR_FBC_MCU_Pin, GPIO_PIN_RESET);
 
     /* PC3 (FLASH) is an input from the sensor - never driven. */
     flash_release();
@@ -585,8 +581,65 @@ static void ramp_task(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+   IR-cut filter: DRV8210 in PH/EN mode. IR_FBC_MCU (PA12) = IN1/PH selects
+   the direction, IR_ENB_MCU (PA11) = IN2/EN drives the coil while HIGH.
+   EN must only be pulsed (the filter latches); held HIGH the coil stays
+   powered and heats. Same wiring and defaults as the KL730's ircut.sh.
+   --------------------------------------------------------------------------- */
+static volatile bool     s_cut_busy     = false;
+static volatile uint32_t s_cut_t0       = 0U;
+static uint32_t          s_cut_ms       = IR_CUT_PULSE_MS;
+static uint8_t           s_cut_night_ph = IR_CUT_NIGHT_PH;
+static int8_t            s_cut_last     = -1;      /* -1 unknown, 0 day, 1 night */
+
+bool IR_LED_IrCut(bool night)
+{
+    uint8_t ph;
+
+    if (s_cut_busy) return false;                 /* one pulse at a time */
+    ph = night ? s_cut_night_ph : (uint8_t)(1U - s_cut_night_ph);
+    HAL_GPIO_WritePin(IR_FBC_MCU_GPIO_Port, IR_FBC_MCU_Pin, ph ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    s_cut_t0   = HAL_GetTick();
+    s_cut_busy = true;
+    HAL_GPIO_WritePin(IR_ENB_MCU_GPIO_Port, IR_ENB_MCU_Pin, GPIO_PIN_SET);   /* drive */
+    s_cut_last = night ? 1 : 0;
+    return true;
+}
+
+static void ircut_task(void)
+{
+    if (s_cut_busy && (HAL_GetTick() - s_cut_t0) >= s_cut_ms) {
+        HAL_GPIO_WritePin(IR_ENB_MCU_GPIO_Port, IR_ENB_MCU_Pin, GPIO_PIN_RESET); /* brake */
+        HAL_GPIO_WritePin(IR_FBC_MCU_GPIO_Port, IR_FBC_MCU_Pin, GPIO_PIN_RESET); /* idle */
+        s_cut_busy = false;
+    }
+}
+
+uint32_t IR_LED_IrCutSetPulse_ms(uint32_t ms)
+{
+    if (ms < IR_CUT_PULSE_MIN_MS) ms = IR_CUT_PULSE_MIN_MS;
+    if (ms > IR_CUT_PULSE_MAX_MS) ms = IR_CUT_PULSE_MAX_MS;
+    s_cut_ms = ms;
+    return ms;
+}
+
+void IR_LED_IrCutSwap(void)
+{
+    s_cut_night_ph ^= 1U;
+}
+
+void IR_LED_IrCutStatus(int *last, uint32_t *pulse_ms, uint32_t *night_ph, bool *busy)
+{
+    if (last)     *last     = s_cut_last;
+    if (pulse_ms) *pulse_ms = s_cut_ms;
+    if (night_ph) *night_ph = s_cut_night_ph;
+    if (busy)     *busy     = s_cut_busy;
+}
+
 void IR_LED_Task(void)
 {
+    ircut_task();
     ramp_task();
     fs_task();
 
@@ -647,9 +700,7 @@ void IR_LED_Enable(bool enable)
         }
     }
 
-    s_master_enable = enable;
-    HAL_GPIO_WritePin(IR_ENB_MCU_GPIO_Port, IR_ENB_MCU_Pin,
-                      enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    s_master_enable = enable;   /* PA11 is the IR-cut EN now - not touched here */
 
     for (int i = 0; i < IR_CH_COUNT; i++) {
         apply_channel((IR_Channel_t)i);

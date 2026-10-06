@@ -27,7 +27,18 @@ ir [ch0|ch1] pwm <hz> <duty%>      PWM on PWM_DIMx (TIM12, shared frequency)
 ir [ch0|ch1] ramp <mA> <ms>        gradual current change (non-blocking)
 ir [ch0|ch1] dacpwm <hz> <duty%>|off  chop DAC_DIMx between 0 V and the setpoint
 ir [ch0|ch1] dactest <mV>|off      DAC bench test up to 1500 mV, BYPASSES the cap
+ir cut day|night                   pulse the IR-cut filter in / out
+ir cut ms <10..1000>               IR-cut pulse length (default 150 ms)
+ir cut swap                        swap PH polarity if day/night are reversed
 ```
+
+**IR-cut filter: PA11 (pin 47, IR_ENB_MCU) and PA12 (pin 48, IR_FBC_MCU)**
+drive a DRV8210 in PH/EN mode: PA12 = IN1/PH (direction), PA11 = IN2/EN
+(drive). EN is only ever pulsed (default 150 ms); held high the coil stays
+powered and heats. Both pins stay low otherwise - earlier firmware wrongly
+held PA11 high from boot as an "18V rail request". Which PH is "night"
+(filter out) depends on the coil wiring: default PH=0 as in the KL730's
+ircut.sh, unverified - use `ir cut swap` if it is reversed.
 
 PWM_DIMx LOW = LED on (Q2/Q3 invert). Only one channel can be gated/strobed,
 and not while the other is held LOW or in PWM: FLASH is pulled high only
