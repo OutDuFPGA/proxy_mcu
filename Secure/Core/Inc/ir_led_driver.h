@@ -68,7 +68,11 @@
   * On the USHIO board the sense resistor is R11 = 2.5mR, so full scale is
   *     51mV / 2.5mR = 20.4A     (matches the "8V/20AMPS" LED connector note)
   *
-  * BUT CTRL2 (pin 13) is tied to a fixed divider off the 2V VREF pin:
+  * REWORKED 2026-10-13: R16 is now 0R (user-confirmed), so CTRL2 = VREF =
+  * 2.0V, above the 1.5V saturation point - no clamp, full 20.4A available.
+  * IR_CTRL2_R_TOP_OHMS below is 0 accordingly. The original fit was:
+  *
+  * CTRL2 (pin 13) was tied to a fixed divider off the 2V VREF pin:
   *     R16 = 45.3k from VREF, R22 = 10k to GND
   *     V_CTRL2 = 2.0V * 10 / 55.3 = 0.3617V
   *
@@ -147,7 +151,7 @@ extern "C" {
 /* USHIO board CTRL2 divider off the 2V VREF pin: R16 top, R22 bottom.
    Set IR_CTRL2_R_TOP_OHMS to 0 to model CTRL2 tied straight to VREF. */
 #define IR_CTRL2_VREF_MV            2000U
-#define IR_CTRL2_R_TOP_OHMS         45300U
+#define IR_CTRL2_R_TOP_OHMS         0U        /* R16 reworked to 0R (was 45.3k) */
 #define IR_CTRL2_R_BOT_OHMS         10000U
 
 /* DAC reference, i.e. VDDA, in millivolts. */
@@ -169,6 +173,20 @@ extern "C" {
    LT3763's current-amp offset can still pass up to ~1.2A (see
    IR_LED_Init), which is below this cap. */
 #define IR_LED_HARD_LIMIT_MA        4000U
+
+/* High-current pulses (IR_LED_SetHighPulse) - the ONLY path above the hard
+   cap. USHIO SMBB850DS-1200: IF = 4A DC, IFP = 20A. The datasheet's
+   "Forward Current - Pulse Duration" curve gives, for repetition rate f,
+   20A up to 1% duty and then a straight log-log line down to 4A at 100%
+   duty, i.e.
+       duty_max(I) = 1% * (20A / I) ^ (ln 100 / ln 5)      for 4A < I <= 20A
+   At 30Hz: 20A <= 333us, 15A <= ~760us, 10A <= ~2.4ms, 6A <= ~10ms.
+   IR_LED_HighPulseMaxWidth_us() applies this at IR_HP_DERATE_PCT of the
+   curve, with f = IR_FRAME_PULSE_FPS; the pulse engine refuses to fire two
+   pulses closer than IR_HP_MIN_SPACING_US so the rate cannot exceed f. */
+#define IR_LED_PULSE_LIMIT_MA       20000U
+#define IR_HP_DERATE_PCT            100U
+#define IR_HP_MIN_SPACING_US        ((1000000U / IR_FRAME_PULSE_FPS) - 1000U)
 
 /* Bench safety cap on the commanded current, in milliamps, applied on top of
    the hard cap above. Adjustable at runtime (up to IR_LED_HARD_LIMIT_MA)
@@ -220,6 +238,24 @@ extern "C" {
 /* ---------------------------------------------------------------------------
    Frame pulse (IR_MODE_FRAME_PULSE) and boot defaults
    --------------------------------------------------------------------------- */
+
+/* Image sensor on this board - selects how PC3 (pin 11, FLASH net) is used.
+   IMX568: PC3 is the sensor's FLASH output, an MCU INPUT (FLASH monitor,
+     gate, strobe, ADC sync); only "fhsync" borrows it as an output while it
+     runs (user-approved 2026-10-14, sensor FLASH disabled).
+   IMX678: PC3 is an MCU OUTPUT from boot, held LOW, driven by "fhsync"; the
+     FLASH-input features are refused. (User instruction 2026-10-14.)
+   Set by tools/build.mk (SENSOR=IMX568|IMX678); defaults to IMX568, so a
+   build without the define (e.g. STM32CubeIDE) keeps the IMX568 wiring. */
+#define IR_SENSOR_IMX568                568
+#define IR_SENSOR_IMX678                678
+#ifndef IR_SENSOR
+#define IR_SENSOR                       IR_SENSOR_IMX568
+#endif
+#if (IR_SENSOR != IR_SENSOR_IMX568) && (IR_SENSOR != IR_SENSOR_IMX678)
+#error "IR_SENSOR must be IR_SENSOR_IMX568 or IR_SENSOR_IMX678"
+#endif
+#define IR_PC3_OUTPUT                   (IR_SENSOR == IR_SENSOR_IMX678)
 
 /* Sensor frame rate. The IMX568 is configured for 30 fps, so without a
    VSYNC edge the MCU generates its own frame start at this rate. */
@@ -493,6 +529,92 @@ bool IR_LED_GetGatePulse(IR_Channel_t ch, uint32_t *on_us, uint32_t *off_us);
    width_us is clamped to 1..IR_FRAME_PULSE_MAX_US; 0 turns the channel off. */
 bool IR_LED_SetFramePulse(IR_Channel_t ch, uint32_t width_us);
 
+/* HIGH-CURRENT PULSE (USHIO 20A test). One pulse of milliamps for width_us
+   per frame tick (TIM7, IR_FRAME_PULSE_FPS; VSYNC if present), using the
+   frame-pulse TIM12 one-pulse engine on PWM_DIMx PLUS the DAC: DAC_DIMx is
+   raised to the pulse current immediately before the gate opens and dropped
+   to 0 V in the TIM12 update interrupt the instant it closes. Outside the
+   pulse the DAC is therefore always 0 V - essential, because Q2/Q3 pass a
+   high FLASH to the LT3763 PWM pin whatever PWM_DIMx does, so a DAC left
+   at 20A would light the LED for most of every frame.
+   milliamps is clamped to IR_LED_PULSE_LIMIT_MA and width_us to
+   IR_LED_HighPulseMaxWidth_us(milliamps). count = number of pulses to fire,
+   0 = continuous. Ends the channel's FLASH gate / PWM / strobe / DAC PWM and
+   sets its DC setpoint to 0. milliamps or width_us 0 stops it.
+   Returns false for a bad channel. */
+bool     IR_LED_SetHighPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t width_us, uint32_t count);
+void     IR_LED_StopHighPulse(IR_Channel_t ch);
+uint32_t IR_LED_HighPulseMaxWidth_us(uint32_t milliamps);
+/* True while hpulse is set up on ch. Out-params (any may be NULL): current
+   commanded (mA, after DAC rounding), width (us), pulses left (0 = endless
+   or finished - see *fired), pulses fired since set up, pulses skipped by
+   the spacing guard. */
+bool     IR_LED_GetHighPulse(IR_Channel_t ch, uint32_t *ma, uint32_t *width_us,
+                             uint32_t *left, uint32_t *fired, uint32_t *skipped);
+
+/* HSYNC PULSE (USHIO 20A test). Per frame, for lines start_line ..
+   start_line + lines - 1 counted from VSYNC (first HSYNC after VSYNC =
+   line 1), DAC_DIMx AND PWM_DIMx follow SN0_HS (PB1): on each rising edge
+   the DAC goes to milliamps and then the gate opens; on each falling edge
+   the gate closes and then the DAC goes to 0 V. TIM12 (one-pulse, no pin
+   output) starts on the first rising edge and cuts both at lines line
+   periods + margin (line period = VSYNC period / lines per frame), so a
+   missing HSYNC edge cannot leave the current up. That DAC-high time is held to
+   IR_LED_HighPulseMaxWidth_us(milliamps): lines is clamped to fit, using the
+   measured line period. count = frames to fire, 0 = continuous. One channel
+   at a time; uses TIM12, so it ends hpulse / frame pulse / gate PWM and is
+   ended by them. Returns false for a bad channel, no HSYNC, or a budget too
+   short for one line. */
+typedef struct {
+    uint32_t ma;            /* pulse current after DAC rounding */
+    uint32_t start_line;
+    uint32_t lines;         /* after the derating clamp */
+    uint32_t window_us;     /* TIM12 cut-off = max DAC-high time per frame */
+    uint32_t left;          /* frames still to fire, 0 = continuous */
+    uint32_t fired;         /* windows started */
+    uint32_t timer_cuts;    /* windows ended by TIM12 rather than HSYNC */
+    uint32_t hs_high_ns;    /* last measured HSYNC HIGH time (0 = not yet) */
+    bool     vs_mode;       /* set up by IR_LED_SetVsyncPulse() */
+    bool     solid;         /* set up by IR_LED_SetVsyncLinePulse() */
+    uint32_t vs_low_ns;     /* vsync mode: last measured VSYNC LOW time */
+    uint32_t skipped;       /* starts refused by the IR_HP_MIN_SPACING_US guard */
+    bool     flash;         /* set up by IR_LED_SetHsyncFlashPulse() */
+    bool     inv;           /* ... with inv: PC3 = NOT HSYNC */
+} IR_HsyncPulseInfo_t;
+
+bool IR_LED_SetHsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                          uint32_t lines, uint32_t count);
+void IR_LED_StopHsyncPulse(IR_Channel_t ch);
+/* FLASH-gated HSYNC PULSE: as IR_LED_SetHsyncPulse() but the gate is the
+   FLASH net - PC3 is switched to a push-pull output for the duration and
+   driven HIGH while HSYNC is HIGH (Q2/Q3 light the LED), LOW otherwise;
+   PWM_DIMx stays HIGH. ONLY with the sensor's FLASH output disabled (user
+   approved 2026-10-14). Stop puts PC3 back to the boot input. Refused
+   (false) while the FLASH ADC sync owns PC3. inv: PC3 = NOT HSYNC instead -
+   HIGH (DAC up first) through the ~1.7 us LOW after each window line, LOW
+   (then DAC 0) from the next rise; same window, clamp and cut-off. */
+bool IR_LED_SetHsyncFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                               uint32_t lines, uint32_t count, bool inv);
+/* HSYNC LOW pulse on PWM_DIMx: as IR_LED_SetHsyncPulse() but the LED is on
+   (DAC up, then PWM_DIMx LOW) through the ~1.7 us HSYNC LOW after each
+   window line, off (PWM_DIMx HIGH, then DAC 0) from the next rise. */
+bool IR_LED_SetHsyncLowPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                             uint32_t lines, uint32_t count);
+/* VSYNC PULSE: same engine, LED on at milliamps while SN0_VS (PC4) is LOW -
+   DAC up and PWM_DIMx low on the falling edge, both off on the rising edge.
+   TIM12 cuts it at IR_LED_HighPulseMaxWidth_us(milliamps) if VSYNC stays
+   low longer. Starts closer than IR_HP_MIN_SPACING_US are skipped. count =
+   pulses, 0 = continuous. Stopped / reported with the hsync functions
+   (info.vs_mode set). Returns false for a bad channel or no VSYNC. */
+bool IR_LED_SetVsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count);
+/* VSYNC LINE PULSE: as IR_LED_SetHsyncPulse() (same line count from VSYNC,
+   pre-line DAC step, derating clamp on lines, TIM12 cut-off) but the LED is
+   held solid ON from line start_line to start_line + lines - 1 instead of
+   following the HSYNC level - one clean pulse per frame. */
+bool IR_LED_SetVsyncLinePulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                              uint32_t lines, uint32_t count);
+bool IR_LED_GetHsyncPulse(IR_Channel_t ch, IR_HsyncPulseInfo_t *info);
+
 /* Width in us; true while the channel is in IR_MODE_FRAME_PULSE. */
 bool IR_LED_GetFramePulse(IR_Channel_t ch, uint32_t *width_us);
 
@@ -569,6 +691,16 @@ typedef struct {
     uint32_t hs_per_frame;  /* HS edges between the last two VS edges */
 } IR_SyncInput_t;
 void IR_LED_GetSyncInput(IR_SyncInput_t *in);
+void IR_LED_GetSyncDebug(uint32_t d[6]);   /* raw monitor values, for status */
+/* fhsync only: PC3 write delay after SN0_HS interrupt entry, ns (rise
+   min/avg/max, fall min/avg/max), last PC3 HIGH ns, PC3 pulses in the last
+   window and min/max over windows, total rises, rises found pending at the
+   end of a fall (late). False when not running. */
+bool IR_LED_GetFlashSyncStats(uint32_t d[12]);
+/* EXTI1 (SN0_HS) handler, first for each edge: rise or fall, late = a rise
+   picked up after handling a fall in the same interrupt. */
+void IR_LED_HsIrqFast(bool rise, bool late);
+bool IR_LED_MeasureHsync(uint32_t d[7]);   /* see ir_led_driver.c; "ir hsmeas" */
 
 /* FLASH gate, per channel: the PC3 edge interrupts drive PWM_DIMx LOW (LED
    on) while FLASH is low (the exposure) and HIGH again when it rises. With
@@ -577,7 +709,7 @@ void IR_LED_GetSyncInput(IR_SyncInput_t *in);
    Only ONE channel can be gated at a time (returns false otherwise): FLASH
    is pulled high only through a channel whose PWM_DIMx is HIGH, so with
    both gated FLASH never rises again and the LEDs latch on. */
-#define IR_FLASH_GATE_AT_BOOT       1
+#define IR_FLASH_GATE_AT_BOOT       (IR_PC3_OUTPUT ? 0 : 1)   /* no FLASH input on IMX678 */
 bool IR_LED_SetFlashGate(IR_Channel_t ch, bool on);
 
 /* Static PWM_DIMx level, per channel: HIGH = LED follows FLASH only, LOW =
@@ -611,8 +743,9 @@ bool IR_LED_SetStrobe(IR_Channel_t ch, bool on);
 
 /* DAC TEST - bench characterisation of DAC_DIMx with J5/J6 UNPLUGGED.
    Drives DAC_DIMx to 0..IR_DACTEST_MAX_MV, BYPASSING IR_LED_HARD_LIMIT_MA.
-   On a connected driver anything above ~362 mV hits the CTRL2 ceiling
-   (~4.9 A), above the LED's 4 A absolute maximum. Stops ramp, strobe and
+   With R16 reworked to 0R there is NO CTRL2 ceiling any more: on a
+   connected driver 1500 mV is ~20 A DC, which destroys the USHIO LED, and
+   anything above ~294 mV exceeds its 4 A DC rating. Stops ramp, strobe and
    DAC chop on the channel; any ma/mv/ramp (SetCurrentRaw) ends it. */
 #define IR_DACTEST_MAX_MV           1500U
 uint32_t IR_LED_SetDacTest_mV(IR_Channel_t ch, uint32_t millivolts);

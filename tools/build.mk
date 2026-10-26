@@ -4,7 +4,23 @@
 # so they cannot run here. Flags below are copied verbatim from
 # Debug/Application/User/Core/subdir.mk and Debug/makefile.
 P   := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
-OUT := $(P)/STM32CubeIDE/Secure/Debug_linux
+
+# Image sensor: IMX568 (default - PC3 is the sensor's FLASH input) or IMX678
+# (PC3 is an MCU output from boot). Each sensor is a separate build with its
+# own output folder and file names, so both images can sit side by side:
+#   make -f tools/build.mk -j8              -> Debug_linux/proxy-mcu_Secure.elf
+#   make -f tools/build.mk SENSOR=IMX678 -j8
+#   (or: make -f tools/build.mk imx678)     -> Debug_linux_imx678/proxy-mcu_Secure_imx678.elf
+SENSOR ?= IMX568
+ifeq ($(SENSOR),IMX568)
+OUT  := $(P)/STM32CubeIDE/Secure/Debug_linux
+NAME := proxy-mcu_Secure
+else ifeq ($(SENSOR),IMX678)
+OUT  := $(P)/STM32CubeIDE/Secure/Debug_linux_imx678
+NAME := proxy-mcu_Secure_imx678
+else
+$(error SENSOR must be IMX568 or IMX678)
+endif
 
 CORE := $(P)/Secure/Core/Src
 APP  := $(P)/STM32CubeIDE/Secure/Application/User/Core
@@ -32,25 +48,41 @@ INC := -I$(P)/Secure/Core/Inc -I$(P)/Secure_nsclib \
        -I$(P)/Drivers/STM32H5xx_HAL_Driver/Inc/Legacy \
        -I$(P)/Drivers/CMSIS/Include
 
+STAMP  := $(OUT)/sensor-$(SENSOR).stamp
+
 CPU   := -mcpu=cortex-m33 -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb
 CFLAGS := $(CPU) -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32H563xx $(INC) \
-          -O0 -ffunction-sections -fdata-sections -Wall -mcmse --specs=nano.specs
+          -O0 -ffunction-sections -fdata-sections -Wall -mcmse --specs=nano.specs \
+          -DIR_SENSOR=IR_SENSOR_$(SENSOR)
 LDFLAGS := $(CPU) -T$(LD) --specs=nosys.specs --specs=nano.specs \
-           -Wl,-Map=$(OUT)/proxy-mcu_Secure.map -Wl,--gc-sections -static \
+           -Wl,-Map=$(OUT)/$(NAME).map -Wl,--gc-sections -static \
            -Wl,--cmse-implib -Wl,--out-implib=$(OUT)/secure_nsclib.o \
            -Wl,--start-group -lc -lm -Wl,--end-group
 
 OBJ := $(addprefix $(OUT)/,$(notdir $(CSRC:.c=.o))) $(OUT)/startup.o
 vpath %.c $(sort $(dir $(CSRC)))
 
-$(OUT)/proxy-mcu_Secure.elf: $(OBJ)
+$(OUT)/$(NAME).elf: $(OBJ)
 	arm-none-eabi-gcc -o $@ $(OBJ) $(LDFLAGS)
-	arm-none-eabi-objcopy -O binary $@ $(OUT)/proxy-mcu_Secure.bin
-	arm-none-eabi-objcopy -O ihex   $@ $(OUT)/proxy-mcu_Secure.hex
+	arm-none-eabi-objcopy -O binary $@ $(OUT)/$(NAME).bin
+	arm-none-eabi-objcopy -O ihex   $@ $(OUT)/$(NAME).hex
 	arm-none-eabi-size $@
 
-$(OUT)/%.o: %.c | $(OUT)
+# Shortcuts: "make -f tools/build.mk imx678" / "imx568" / "both".
+.PHONY: imx568 imx678 both
+imx568:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) SENSOR=IMX568
+imx678:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) SENSOR=IMX678
+both: imx568 imx678
+
+# Objects carry the sensor choice: switching SENSOR rebuilds everything.
+$(OUT)/%.o: %.c $(STAMP) | $(OUT)
 	arm-none-eabi-gcc $(CFLAGS) -c $< -o $@
+
+$(STAMP): | $(OUT)
+	rm -f $(OUT)/sensor-*.stamp
+	touch $@
 
 $(OUT)/startup.o: $(ASRC) | $(OUT)
 	arm-none-eabi-gcc $(CPU) -g3 -c -x assembler-with-cpp $< -o $@

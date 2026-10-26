@@ -25,6 +25,26 @@ static void print_help(IR_LED_CLI_PrintFn p)
     p("  ir [ch0|ch1] ramp <mA> <ms>  - Change current gradually to <mA> over <ms> (non-blocking)\r\n");
     p("  ir [ch0|ch1] dacpwm <hz> <duty%>|off - Chop DAC_DIMx between 0 V and the setpoint\r\n");
     p("  ir [ch0|ch1] dactest <0..1500 mV>|off - DAC test, BYPASSES the 4 A cap (unplug J5/J6!)\r\n");
+    p("  ir [ch0|ch1] hpulse <mA> <us> [n] - HIGH-CURRENT pulse (<=20 A), one per 30 Hz frame,\r\n");
+    p("                            n pulses (default 0 = continuous); width clamped to USHIO derating\r\n");
+    p("  ir [ch0|ch1] hpulse off - stop high-current pulses (DAC 0 V)\r\n");
+    p("  ir hpulse table         - max pulse width per current at 30 Hz\r\n");
+    p("  ir [ch0|ch1] hsync <mA> <line> <lines> [n] - DAC_DIMx + PWM_DIMx follow HSYNC HIGH for <lines> lines\r\n");
+    p("                            from <line> after VSYNC, at <mA> (<=20 A); window held to the\r\n");
+    p("                            USHIO derating (TIM12 cut-off), n frames (0 = continuous)\r\n");
+    p("  ir [ch0|ch1] hsync <mA> <line> <lines> [n] inv - LED on (DAC up, PWM_DIMx LOW) during each\r\n");
+    p("               ~1.7 us HSYNC LOW in the window instead of HSYNC HIGH\r\n");
+    p("  ir [ch0|ch1] hsync on|off - repeat last hsync settings (default 20000 100 21) / stop\r\n");
+    p("  ir [ch0|ch1] fhsync <mA> <line> <lines> [n] - as hsync, but PC3 (FLASH) is DRIVEN HIGH while\r\n");
+    p("               HSYNC is HIGH (PWM_DIMx stays HIGH) - sensor FLASH output must be disabled\r\n");
+    p("  ir [ch0|ch1] fhsync <mA> <line> <lines> [n] inv - PC3 = inverted HSYNC: HIGH (LED on) through\r\n");
+    p("               each ~1.7 us HSYNC LOW in the window, DAC_DIMx up only then\r\n");
+    p("  ir [ch0|ch1] fhsync on|off - repeat last fhsync settings / stop (PC3 back to input)\r\n");
+    p("  ir [ch0|ch1] vsync <mA> [n] - LED on at <mA> (<=20 A) while VSYNC is LOW, cut off at\r\n");
+    p("                            the USHIO derating width; n pulses (0 = continuous)\r\n");
+    p("  ir [ch0|ch1] vsync <mA> <line> <lines> [n] - one solid pulse per frame from <line> after\r\n");
+    p("                            VSYNC for <lines> lines (clamped to the USHIO derating)\r\n");
+    p("  ir [ch0|ch1] vsync on|off - repeat last vsync settings (default 20000) / stop\r\n");
     p("  ir cut day|night        - pulse the IR-cut filter in (day) / out (night): PA11 EN, PA12 PH\r\n");
     p("  ir cut ms <10..1000>    - IR-cut pulse length (default 150 ms)\r\n");
     p("  ir cut swap             - swap PH polarity if day/night come out reversed\r\n");
@@ -53,7 +73,14 @@ static void print_status(IR_LED_CLI_PrintFn p)
     char l[110];
     IR_FlashInput_t fl;
 
+#if IR_PC3_OUTPUT
+    (void)fl;
+    snprintf(l, sizeof(l), "Sensor IMX678: FLASH (PC3 out) driven %s\r\n",
+             (FLASH_GPIO_Port->ODR & FLASH_Pin) ? "HIGH" : "LOW");
+    p(l);
+#else
     IR_LED_GetFlashInput(&fl);
+    p("Sensor IMX568: PC3 = FLASH input\r\n");
     if (fl.toggling) {
         uint32_t mhz = fl.period_us ? (1000000000U / fl.period_us) : 0U;   /* milli-Hz */
         snprintf(l, sizeof(l), "FLASH (PC3 in):   %s  %lu.%02lu Hz  low %lu.%02lu ms  falls %lu\r\n",
@@ -67,6 +94,7 @@ static void print_status(IR_LED_CLI_PrintFn p)
                  (unsigned long)fl.idle_ms, (unsigned long)fl.falls);
     }
     p(l);
+#endif
 
     IR_SyncInput_t sy;
     IR_LED_GetSyncInput(&sy);
@@ -79,6 +107,14 @@ static void print_status(IR_LED_CLI_PrintFn p)
         snprintf(l, sizeof(l), "SN0_VS (PC4 in):  NOT toggling (count %lu)\r\n", (unsigned long)sy.vs_count);
     }
     p(l);
+    if (!sy.vs_active || !sy.vs_period_us || !sy.hs_period_ns) {
+        uint32_t d[6];
+        IR_LED_GetSyncDebug(d);
+        snprintf(l, sizeof(l), "  dbg: tick %lu vs_ms %lu vs_cyc %lu hs_cyc %lu sysclk %lu cyccnt %lu\r\n",
+                 (unsigned long)d[0], (unsigned long)d[1], (unsigned long)d[2], (unsigned long)d[3],
+                 (unsigned long)d[4], (unsigned long)d[5]);
+        p(l);
+    }
     if (sy.hs_active && sy.hs_period_ns) {
         uint32_t hz = (uint32_t)(1000000000ULL / sy.hs_period_ns);
         snprintf(l, sizeof(l), "SN0_HS (PB1 in):  %lu.%03lu kHz  period %lu ns  lines/frame %lu\r\n",
@@ -134,6 +170,58 @@ static void print_status(IR_LED_CLI_PrintFn p)
                  (unsigned long)IR_LED_GetCtrlVoltage_mV(ch), IR_LED_GetCurrentRaw(ch),
                  (unsigned long)IR_LED_GetCurrent_mA(ch), (unsigned long)IR_LED_GetCurrentLimit_mA());
         p(l);
+        uint32_t hma, hw, hleft, hfired, hskip;
+        if (IR_LED_GetHighPulse(ch, &hma, &hw, &hleft, &hfired, &hskip)) {
+            char cnt[24];
+            if (hleft) snprintf(cnt, sizeof(cnt), "%lu left", (unsigned long)hleft);
+            else       snprintf(cnt, sizeof(cnt), "continuous");
+            snprintf(l, sizeof(l), "  HPULSE: %lu mA x %lu us per frame, %s, fired %lu, skipped %lu\r\n",
+                     (unsigned long)hma, (unsigned long)hw, cnt, (unsigned long)hfired, (unsigned long)hskip);
+            p(l);
+        }
+        IR_HsyncPulseInfo_t hs;
+        if (IR_LED_GetHsyncPulse(ch, &hs) && hs.vs_mode) {
+            char cnt[24];
+            if (hs.left) snprintf(cnt, sizeof(cnt), "%lu left", (unsigned long)hs.left);
+            else         snprintf(cnt, sizeof(cnt), "continuous");
+            snprintf(l, sizeof(l), "  VSYNC PULSE: %lu mA while VSYNC LOW, cut-off %lu us, %s\r\n",
+                     (unsigned long)hs.ma, (unsigned long)hs.window_us, cnt);
+            p(l);
+            snprintf(l, sizeof(l), "               fired %lu, timer cut-offs %lu, skipped %lu, VSYNC LOW %lu ns\r\n",
+                     (unsigned long)hs.fired, (unsigned long)hs.timer_cuts, (unsigned long)hs.skipped,
+                     (unsigned long)hs.vs_low_ns);
+            p(l);
+        } else if (IR_LED_GetHsyncPulse(ch, &hs)) {
+            char cnt[24];
+            if (hs.left) snprintf(cnt, sizeof(cnt), "%lu left", (unsigned long)hs.left);
+            else         snprintf(cnt, sizeof(cnt), "continuous");
+            snprintf(l, sizeof(l), "  %s: %lu mA, lines %lu..%lu, cut-off %lu us, %s\r\n",
+                     hs.solid ? "VSYNC LINE PULSE (solid)" :
+                     (hs.inv ? (hs.flash ? "HSYNC PULSE (PC3 = inverted HSYNC)" : "HSYNC PULSE (PWM_DIM on HSYNC LOW)")
+                             : (hs.flash ? "HSYNC PULSE (FLASH/PC3 gate)" : "HSYNC PULSE")),
+                     (unsigned long)hs.ma, (unsigned long)hs.start_line,
+                     (unsigned long)(hs.start_line + hs.lines - 1U), (unsigned long)hs.window_us, cnt);
+            p(l);
+            if (hs.solid)
+                snprintf(l, sizeof(l), "               fired %lu, timer cut-offs %lu\r\n",
+                         (unsigned long)hs.fired, (unsigned long)hs.timer_cuts);
+            else
+                snprintf(l, sizeof(l), "               fired %lu, timer cut-offs %lu, HSYNC HIGH %lu ns\r\n",
+                         (unsigned long)hs.fired, (unsigned long)hs.timer_cuts, (unsigned long)hs.hs_high_ns);
+            p(l);
+            uint32_t fx[12];
+            if ((hs.flash || hs.inv) && IR_LED_GetFlashSyncStats(fx)) {
+                snprintf(l, sizeof(l), hs.inv ? "  gate on after HSYNC fall %lu/%lu/%lu ns, gate off after HSYNC rise %lu/%lu/%lu ns\r\n"
+                                              : "  PC3 vs HSYNC (from IRQ entry): rise %lu/%lu/%lu ns, fall %lu/%lu/%lu ns (min/avg/max)\r\n",
+                         (unsigned long)fx[0], (unsigned long)fx[1], (unsigned long)fx[2],
+                         (unsigned long)fx[3], (unsigned long)fx[4], (unsigned long)fx[5]);
+                p(l);
+                snprintf(l, sizeof(l), "               gate on %lu ns, pulses/window %lu (min %lu max %lu), rises %lu, late %lu\r\n",
+                         (unsigned long)fx[6], (unsigned long)fx[7], (unsigned long)fx[8],
+                         (unsigned long)fx[9], (unsigned long)fx[10], (unsigned long)fx[11]);
+                p(l);
+            }
+        }
         uint32_t rto, rleft, dhz, dduty, tmv;
         if (IR_LED_GetDacTest(ch, &tmv)) {
             snprintf(l, sizeof(l), "  DAC TEST: DAC_DIM%d = %lu mV - current cap BYPASSED ('ir ch%d dactest off')\r\n",
@@ -165,6 +253,14 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
 
     if (rest[0] == '\0' || strcmp(rest, "help") == 0) { print_help(print_fn);   return true; }
     if (strcmp(rest, "status") == 0)                  { print_status(print_fn); return true; }
+    if (strcmp(rest, "hsmeas") == 0) {
+        uint32_t d[7];
+        if (!IR_LED_MeasureHsync(d)) { print_fn("ERROR: stop hsync/vsync/fhsync first\r\n"); return true; }
+        snprintf(line, sizeof(line), "SN0_HS polled 1 ms (IRQs off): HIGH %lu/%lu/%lu ns, LOW %lu/%lu/%lu ns (min/avg/max), %lu periods\r\n",
+                 (unsigned long)d[0], (unsigned long)d[1], (unsigned long)d[2],
+                 (unsigned long)d[3], (unsigned long)d[4], (unsigned long)d[5], (unsigned long)d[6]);
+        print_fn(line); return true;
+    }
 
     if (strcmp(rest, "cut day") == 0 || strcmp(rest, "cut night") == 0) {
         bool night = (rest[4] == 'n');
@@ -197,11 +293,206 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
         return true;
     }
 
+    if (strcmp(rest, "hpulse table") == 0) {
+        static const uint32_t tbl[] = { 4000U, 5000U, 6000U, 8000U, 10000U, 12000U, 15000U, 18000U, 20000U };
+        snprintf(line, sizeof(line), "USHIO SMBB850DS-1200 max pulse width at %lu Hz (derate %lu%%):\r\n",
+                 (unsigned long)IR_FRAME_PULSE_FPS, (unsigned long)IR_HP_DERATE_PCT);
+        print_fn(line);
+        for (unsigned i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
+            uint32_t w = IR_LED_HighPulseMaxWidth_us(tbl[i]);
+            snprintf(line, sizeof(line), "  %5lu mA : %5lu us  (%lu.%02lu%% duty)\r\n",
+                     (unsigned long)tbl[i], (unsigned long)w,
+                     (unsigned long)(w * IR_FRAME_PULSE_FPS / 10000U),
+                     (unsigned long)((w * IR_FRAME_PULSE_FPS / 100U) % 100U));
+            print_fn(line);
+        }
+        return true;
+    }
+
     /* Optional channel prefix; without one, commands address CH0. */
     IR_Channel_t ch = IR_CH0;
     if (strncmp(rest, "ch0 ", 4) == 0)      { rest += 4; }
     else if (strncmp(rest, "ch1 ", 4) == 0) { ch = IR_CH1; rest += 4; }
     int n = (int)ch;
+
+    /* "hsync on" / "vsync on" repeat the last settings (20 A by default). */
+    static char hs_last[40] = "20000 100 21";
+    static char vs_last[40] = "20000";
+    static char fhs_last[40] = "20000 100 21";
+    if (strcmp(rest, "fhsync on") == 0) {
+        char re[64];
+        snprintf(re, sizeof(re), "ir ch%d fhsync %s", n, fhs_last);
+        snprintf(line, sizeof(line), "NOTE: '%s'\r\n", re);
+        print_fn(line);
+        return IR_LED_CLI_ProcessCommand(re, print_fn);
+    }
+    if (strcmp(rest, "hsync on") == 0 || strcmp(rest, "vsync on") == 0) {
+        char re[64];
+        bool hsr = (rest[0] == 'h');
+        snprintf(re, sizeof(re), "ir ch%d %s %s", n, hsr ? "hsync" : "vsync", hsr ? hs_last : vs_last);
+        snprintf(line, sizeof(line), "NOTE: '%s'\r\n", re);
+        print_fn(line);
+        return IR_LED_CLI_ProcessCommand(re, print_fn);
+    }
+
+    if (strncmp(rest, "hsync ", 6) == 0 || strncmp(rest, "fhsync ", 7) == 0) {
+        bool fl = (rest[0] == 'f');
+        const char *a = rest + (fl ? 7 : 6);
+        if (strcmp(a, "off") == 0) {
+            IR_LED_StopHsyncPulse(ch);
+            snprintf(line, sizeof(line), "SUCCESS: ch%d HSYNC pulse off (DAC_DIM%d 0 V, PWM_DIM%d HIGH%s)\r\n", n, n, n,
+                     fl ? (IR_PC3_OUTPUT ? ", PC3 output LOW" : ", PC3 input") : "");
+            print_fn(line); return true;
+        }
+        char *e1, *e2, *e3;
+        long ma  = strtol(a, &e1, 10);
+        long st  = strtol(e1, &e2, 10);
+        long nl  = strtol(e2, &e3, 10);
+        long cnt = strtol(e3, NULL, 10);
+        if (e1 == a || e2 == e1 || e3 == e2 || ma <= 0 || st <= 0 || nl <= 0 || cnt < 0) {
+            print_fn(fl ? "ERROR: usage 'ir [ch0|ch1] fhsync <mA> <start_line> <lines> [count]' or 'fhsync off'\r\n"
+                        : "ERROR: usage 'ir [ch0|ch1] hsync <mA> <start_line> <lines> [count]' or 'hsync off'\r\n");
+            return true;
+        }
+        if (ma > (long)IR_LED_PULSE_LIMIT_MA) {
+            snprintf(line, sizeof(line), "NOTE: clamped to the %lu mA pulse limit\r\n", (unsigned long)IR_LED_PULSE_LIMIT_MA);
+            print_fn(line);
+        }
+        bool inv = (strstr(a, "inv") != NULL);
+        bool ok = fl ? IR_LED_SetHsyncFlashPulse(ch, (uint32_t)ma, (uint32_t)st, (uint32_t)nl, (uint32_t)cnt, inv)
+                : inv ? IR_LED_SetHsyncLowPulse(ch, (uint32_t)ma, (uint32_t)st, (uint32_t)nl, (uint32_t)cnt)
+                     : IR_LED_SetHsyncPulse(ch, (uint32_t)ma, (uint32_t)st, (uint32_t)nl, (uint32_t)cnt);
+        if (!ok) {
+            print_fn(fl ? "ERROR: HSYNC (SN0_HS, PB1) not toggling, derating budget shorter than 2 lines, or FLASH ADC sync running\r\n"
+                        : "ERROR: HSYNC (SN0_HS, PB1) not toggling, or derating budget shorter than 2 lines\r\n");
+            return true;
+        }
+        snprintf(fl ? fhs_last : hs_last, sizeof(hs_last), "%ld %ld %ld %ld%s", ma, st, nl, cnt, inv ? " inv" : "");
+        IR_HsyncPulseInfo_t hs;
+        (void)IR_LED_GetHsyncPulse(ch, &hs);
+        if (hs.lines < (uint32_t)nl) {
+            snprintf(line, sizeof(line), "NOTE: lines clamped to %lu - USHIO derating at this current and %lu Hz\r\n",
+                     (unsigned long)hs.lines, (unsigned long)IR_FRAME_PULSE_FPS);
+            print_fn(line);
+        }
+        snprintf(line, sizeof(line), "SUCCESS: ch%d HSYNC pulse%s %lu mA, lines %lu..%lu, cut-off %lu us, %s\r\n", n,
+                 inv ? (fl ? " (PC3 = inverted HSYNC)" : " (PWM_DIM on HSYNC LOW)") : (fl ? " (FLASH/PC3 gate)" : ""),
+                 (unsigned long)hs.ma, (unsigned long)hs.start_line,
+                 (unsigned long)(hs.start_line + hs.lines - 1U), (unsigned long)hs.window_us,
+                 cnt ? "burst" : "continuous");
+        print_fn(line);
+        snprintf(line, sizeof(line), "NOTE: scope TP2 (ISMON, %lu mV at full current), %s and SN0_HS\r\n",
+                 (unsigned long)(hs.ma / 20U), fl ? "PC3 (FLASH)" : (ch == IR_CH0 ? "PWM_DIM0" : "PWM_DIM1"));
+        print_fn(line);
+        return true;
+    }
+
+    if (strncmp(rest, "vsync ", 6) == 0) {
+        const char *a = rest + 6;
+        if (strcmp(a, "off") == 0) {
+            IR_LED_StopHsyncPulse(ch);
+            snprintf(line, sizeof(line), "SUCCESS: ch%d VSYNC pulse off (DAC_DIM%d 0 V, PWM_DIM%d HIGH)\r\n", n, n, n);
+            print_fn(line); return true;
+        }
+        char *e1, *e2, *e3, *e4;
+        long ma  = strtol(a, &e1, 10);
+        long cnt = strtol(e1, &e2, 10);
+        long v3  = strtol(e2, &e3, 10);
+        long v4  = strtol(e3, &e4, 10);
+        if (e3 != e2) {                       /* <mA> <line> <lines> [count]: solid line pulse */
+            long st = cnt, nl = v3, lc = (e4 != e3) ? v4 : 0;
+            if (e1 == a || ma <= 0 || st <= 0 || nl <= 0 || lc < 0) {
+                print_fn("ERROR: usage 'ir [ch0|ch1] vsync <mA> <line> <lines> [count]'\r\n"); return true;
+            }
+            if (ma > (long)IR_LED_PULSE_LIMIT_MA) {
+                snprintf(line, sizeof(line), "NOTE: clamped to the %lu mA pulse limit\r\n", (unsigned long)IR_LED_PULSE_LIMIT_MA);
+                print_fn(line);
+            }
+            if (!IR_LED_SetVsyncLinePulse(ch, (uint32_t)ma, (uint32_t)st, (uint32_t)nl, (uint32_t)lc)) {
+                print_fn("ERROR: HSYNC (SN0_HS, PB1) not toggling, or derating budget shorter than 2 lines\r\n");
+                return true;
+            }
+            snprintf(vs_last, sizeof(vs_last), "%ld %ld %ld %ld", ma, st, nl, lc);
+            IR_HsyncPulseInfo_t hs;
+            (void)IR_LED_GetHsyncPulse(ch, &hs);
+            if (hs.lines < (uint32_t)nl) {
+                snprintf(line, sizeof(line), "NOTE: lines clamped to %lu - USHIO derating at this current and %lu Hz\r\n",
+                         (unsigned long)hs.lines, (unsigned long)IR_FRAME_PULSE_FPS);
+                print_fn(line);
+            }
+            snprintf(line, sizeof(line), "SUCCESS: ch%d VSYNC line pulse %lu mA, solid lines %lu..%lu, cut-off %lu us, %s\r\n", n,
+                     (unsigned long)hs.ma, (unsigned long)hs.start_line,
+                     (unsigned long)(hs.start_line + hs.lines - 1U), (unsigned long)hs.window_us,
+                     lc ? "burst" : "continuous");
+            print_fn(line);
+            snprintf(line, sizeof(line), "NOTE: scope TP2 (ISMON, %lu mV at full current), PWM_DIM%d and SN0_VS\r\n",
+                     (unsigned long)(hs.ma / 20U), n);
+            print_fn(line);
+            return true;
+        }
+        if (e1 == a || ma <= 0 || cnt < 0) {
+            print_fn("ERROR: usage 'ir [ch0|ch1] vsync <mA> [count]' or 'vsync <mA> <line> <lines> [count]'\r\n"); return true;
+        }
+        if (ma > (long)IR_LED_PULSE_LIMIT_MA) {
+            snprintf(line, sizeof(line), "NOTE: clamped to the %lu mA pulse limit\r\n", (unsigned long)IR_LED_PULSE_LIMIT_MA);
+            print_fn(line);
+        }
+        if (!IR_LED_SetVsyncPulse(ch, (uint32_t)ma, (uint32_t)cnt)) {
+            print_fn("ERROR: VSYNC (SN0_VS, PC4) not toggling\r\n"); return true;
+        }
+        snprintf(vs_last, sizeof(vs_last), "%ld %ld", ma, cnt);
+        IR_HsyncPulseInfo_t hs;
+        (void)IR_LED_GetHsyncPulse(ch, &hs);
+        snprintf(line, sizeof(line), "SUCCESS: ch%d VSYNC pulse %lu mA while VSYNC LOW, cut-off %lu us, %s\r\n", n,
+                 (unsigned long)hs.ma, (unsigned long)hs.window_us, cnt ? "burst" : "continuous");
+        print_fn(line);
+        snprintf(line, sizeof(line), "NOTE: scope TP2 (ISMON, %lu mV at full current), PWM_DIM%d and SN0_VS\r\n",
+                 (unsigned long)(hs.ma / 20U), n);
+        print_fn(line);
+        return true;
+    }
+
+    /* Any other per-channel command takes the channel back from hsync. */
+    IR_LED_StopHsyncPulse(ch);
+
+    if (strncmp(rest, "hpulse ", 7) == 0) {
+        const char *a = rest + 7;
+        if (strcmp(a, "off") == 0) {
+            IR_LED_StopHighPulse(ch);
+            snprintf(line, sizeof(line), "SUCCESS: ch%d high-current pulse off (DAC_DIM%d 0 V, PWM_DIM%d HIGH)\r\n", n, n, n);
+            print_fn(line); return true;
+        }
+        char *e1, *e2;
+        long ma = strtol(a, &e1, 10);
+        long us = strtol(e1, &e2, 10);
+        long cnt = strtol(e2, NULL, 10);
+        if (e1 == a || e2 == e1 || ma <= 0 || us <= 0 || cnt < 0) {
+            print_fn("ERROR: usage 'ir [ch0|ch1] hpulse <mA> <us> [count]' or 'hpulse off'\r\n"); return true;
+        }
+        if (ma > (long)IR_LED_PULSE_LIMIT_MA) {
+            snprintf(line, sizeof(line), "NOTE: clamped to the %lu mA pulse limit\r\n", (unsigned long)IR_LED_PULSE_LIMIT_MA);
+            print_fn(line);
+        }
+        uint32_t maxw = IR_LED_HighPulseMaxWidth_us((uint32_t)ma);
+        if ((uint32_t)us > maxw) {
+            snprintf(line, sizeof(line), "NOTE: width clamped to %lu us - USHIO derating at this current and %lu Hz\r\n",
+                     (unsigned long)maxw, (unsigned long)IR_FRAME_PULSE_FPS);
+            print_fn(line);
+        }
+        if (!IR_LED_SetHighPulse(ch, (uint32_t)ma, (uint32_t)us, (uint32_t)cnt)) {
+            print_fn("ERROR: could not start high-current pulse\r\n"); return true;
+        }
+        uint32_t gma, gw;
+        (void)IR_LED_GetHighPulse(ch, &gma, &gw, NULL, NULL, NULL);
+        snprintf(line, sizeof(line), "SUCCESS: ch%d hpulse %lu mA x %lu us at %lu Hz, %s\r\n", n,
+                 (unsigned long)gma, (unsigned long)gw, (unsigned long)IR_FRAME_PULSE_FPS,
+                 cnt ? "burst" : "continuous");
+        print_fn(line);
+        snprintf(line, sizeof(line), "NOTE: scope TP2 (ISMON, 50 mV/A -> %lu mV) and PWM_DIM%d; DAC 0 V between pulses\r\n",
+                 (unsigned long)(gma / 20U), n);
+        print_fn(line);
+        return true;
+    }
 
     if (strncmp(rest, "ramp ", 5) == 0) {
         char *end;
@@ -223,6 +514,12 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
         return true;
     }
 
+#if IR_PC3_OUTPUT
+    if (strcmp(rest, "strobe on") == 0 || strcmp(rest, "gate on") == 0 || strcmp(rest, "gate inv") == 0) {
+        print_fn("ERROR: IMX678 build - PC3 (FLASH) is an MCU output, there is no FLASH input to gate/strobe on\r\n");
+        return true;
+    }
+#endif
     if (strcmp(rest, "strobe on") == 0 || strcmp(rest, "strobe off") == 0) {
         bool on = (rest[8] == 'n');
         if (!IR_LED_SetStrobe(ch, on)) {
@@ -254,8 +551,8 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
         uint32_t got = IR_LED_SetDacTest_mV(ch, (uint32_t)mv);
         snprintf(line, sizeof(line), "SUCCESS: ch%d DAC TEST - DAC_DIM%d = %lu mV, current cap BYPASSED\r\n", n, n, (unsigned long)got);
         print_fn(line);
-        print_fn("WARNING: for J5/J6 UNPLUGGED only. On a driver, >~362 mV CTRL1 gives the ~4.9 A CTRL2\r\n");
-        print_fn("         ceiling - above the LED's 4 A abs max. Strobe/ramp/dacpwm stopped on this channel.\r\n");
+        print_fn("WARNING: for J5/J6 UNPLUGGED only. R16 is 0R now - NO CTRL2 ceiling: on a driver,\r\n");
+        print_fn("         >294 mV is over the LED's 4 A DC max, 1500 mV is ~20 A DC. Strobe/ramp/dacpwm stopped.\r\n");
         print_fn("         'dactest off', ma, mv or ramp restores the capped setpoint.\r\n");
         return true;
     }

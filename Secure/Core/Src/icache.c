@@ -36,7 +36,13 @@ void MX_ICACHE_Init(void)
 
   /* USER CODE END ICACHE_Init 1 */
   /* USER CODE BEGIN ICACHE_Init 2 */
-
+  /* The generated init never switched the cache on, so every fetch waited
+     out the 3 flash wait states (2026-10-14: the SN0_HS interrupt took ~180
+     cycles to reach its first GPIO write). Default 2-way mode. */
+  if (HAL_ICACHE_Enable() != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END ICACHE_Init 2 */
 
 }

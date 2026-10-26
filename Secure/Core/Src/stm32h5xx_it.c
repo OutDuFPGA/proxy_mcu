@@ -19,6 +19,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <stdbool.h>
 #include "stm32h5xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -255,9 +256,32 @@ void EXTI0_IRQHandler(void)
 /**
   * @brief This function handles EXTI Line 1 interrupt (SN0_HS, PB1 - sensor HSYNC).
   */
-void EXTI1_IRQHandler(void)
+__attribute__((optimize("O2"))) void EXTI1_IRQHandler(void)
 {
-  HAL_GPIO_EXTI_IRQHandler(SN0_HS_Pin);
+  /* SN0_HS, both edges inside an fhsync window. HAL_GPIO_EXTI_IRQHandler()
+     is inlined (its -O0 call chain cost too much of each 14.9 us line) and
+     IR_LED_HsIrqFast() writes PC3 before the bookkeeping. HSYNC is LOW only
+     ~1.7 us, so a rise can be pending by the time a fall is done: loop and
+     take it here, fall first (it is the older edge). */
+  extern volatile uint32_t g_hs_irq_t;   /* ir_led_driver.c: PC3-vs-HSYNC timing */
+  extern void IR_LED_HsIrqFast(bool rise, bool late);
+  bool after_fall = false;
+  for (;;) {
+    uint32_t f = EXTI->FPR1 & SN0_HS_Pin, r = EXTI->RPR1 & SN0_HS_Pin;
+    if ((f | r) == 0U) break;
+    g_hs_irq_t = TIM5->CNT;
+    if (f) {
+      EXTI->FPR1 = SN0_HS_Pin;
+      IR_LED_HsIrqFast(false, false);
+      HAL_GPIO_EXTI_Falling_Callback(SN0_HS_Pin);
+      after_fall = true;
+      continue;                          /* re-check: a rise may be pending now */
+    }
+    EXTI->RPR1 = SN0_HS_Pin;
+    IR_LED_HsIrqFast(true, after_fall);
+    HAL_GPIO_EXTI_Rising_Callback(SN0_HS_Pin);
+    break;
+  }
 }
 
 /**

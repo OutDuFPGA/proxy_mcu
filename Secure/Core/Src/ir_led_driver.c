@@ -8,6 +8,16 @@
   */
 #include "ir_led_driver.h"
 #include "dac.h"
+#include <math.h>
+
+/* Free-running 32-bit timestamp at HCLK - see IR_LED_Init() (TIM5). */
+#define IR_CYCCNT  (TIM5->CNT)
+
+/* The project builds at -O0. The SN0_HS interrupt fires on both edges in an
+   hsync window (~134k/s, ~470 cycles each at 64 MHz), so its path is built
+   at -O2 or it overruns and loses HSYNC edges (seen 2026-10-14: lines/frame
+   2203 instead of 2233 and a TIM12 cut-off every window). */
+#define IR_HOT  __attribute__((optimize("O2")))
 
 /* ---------------------------------------------------------------------------
    Gate polarity. The single place the proxy board's open-drain inverter is
@@ -61,6 +71,18 @@ static uint32_t          s_gate_period_ticks = 0U;
 static uint32_t          s_fp_width_us   = 0U;
 static volatile uint32_t s_fp_count      = 0U;
 static volatile uint32_t s_last_vsync_ms = 0U;
+/* High-current pulse state (IR_LED_SetHighPulse). Bit n of s_hp_mask = channel
+   n is in hpulse. s_hp_code is the pulse DAC code - deliberately NOT raw_code,
+   so the hard cap on raw_code still holds for every other path. s_hp_left:
+   pulses still to fire, IR_HP_ENDLESS for continuous. */
+#define IR_HP_ENDLESS            0xFFFFFFFFU
+static volatile uint32_t s_hp_mask       = 0U;
+static volatile uint16_t s_hp_code[IR_CH_COUNT]    = { 0U, 0U };
+static volatile uint32_t s_hp_left[IR_CH_COUNT]    = { 0U, 0U };
+static volatile uint32_t s_hp_fired[IR_CH_COUNT]   = { 0U, 0U };
+static volatile uint32_t s_hp_skipped[IR_CH_COUNT] = { 0U, 0U };
+static volatile uint32_t s_hp_last_cyc   = 0U;
+static volatile bool     s_hp_any_fired  = false;
 /* Strobe: channels whose DAC_DIMx is switched with FLASH (setpoint while
    FLASH is low, 0 V while high). Bit n = channel n. */
 static volatile uint32_t s_dac_gate      = 0U;
@@ -171,6 +193,12 @@ static void fs_sync_running(void);             /* fwd decl */
 static void fs_task(void);                     /* fwd decl */
 static bool fs_gate_wanted(void);              /* fwd decl */
 static void evict_other_tim12_user(IR_Channel_t ch, IR_LedMode_t conflicting);
+static void hp_clear(IR_Channel_t ch);         /* fwd decl */
+static void hp_task(void);                     /* fwd decl */
+static void hsp_timer_cut(void);               /* fwd decl */
+static void hsp_flash_pin(bool out);            /* fwd decl */
+static void hsp_task(void);                    /* fwd decl */
+static bool hsp_active(void);                  /* fwd decl */
 
 static void apply_channel(IR_Channel_t ch)
 {
@@ -178,6 +206,19 @@ static void apply_channel(IR_Channel_t ch)
 
     /* Start or stop the PC3 ADC to match whether any channel needs it. */
     fs_sync_running();
+
+    /* hsync pulse owns TIM12: either TIM12 mode on any channel ends it. */
+    if (hsp_active() && (c->mode == IR_MODE_GATE_PWM || c->mode == IR_MODE_FRAME_PULSE)) {
+        IR_LED_StopHsyncPulse(IR_CH0);
+        IR_LED_StopHsyncPulse(IR_CH1);
+    }
+
+    /* hpulse lives inside FRAME_PULSE: any other state, a fault or the
+       master enable going off ends it, DAC first. */
+    if ((s_hp_mask & (1UL << ch)) != 0U &&
+        (c->mode != IR_MODE_FRAME_PULSE || !s_master_enable || c->fault_latched)) {
+        hp_clear(ch);
+    }
 
     /* Any state other than "actively chopping" must first take the pin back
        from TIM12, otherwise the timer would keep driving it regardless of
@@ -512,9 +553,24 @@ void IR_LED_Init(void)
     }
     s_gate_period_ticks = 0U;
 
-    /* FLASH input monitor timestamps PC3 edges with the cycle counter. */
-    DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
-    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+    /* Sync/FLASH monitors and the hsync engine timestamp edges with TIM5, a
+       free-running 32-bit counter at HCLK (APB1 /1, so 64 MHz = one tick per
+       core cycle). Not the DWT cycle counter: that only runs while a debug
+       probe keeps the debug domain powered - on 2026-10-14 it froze a few
+       seconds after the ST-LINK let go, so every period read 0 ("NOT
+       toggling") and hsync refused to start. */
+    __HAL_RCC_TIM5_CLK_ENABLE();
+    TIM5->CR1 = 0U;
+    TIM5->PSC = 0U;
+    TIM5->ARR = 0xFFFFFFFFU;
+    TIM5->EGR = TIM_EGR_UG;
+    TIM5->CR1 = TIM_CR1_CEN;
+
+#if IR_PC3_OUTPUT
+    /* IMX678: PC3 is an MCU output for good - push-pull LOW from here on
+       (gpio.c brought it up as the IMX568 input; this replaces that). */
+    hsp_flash_pin(true);
+#endif
 
     /* Operating mode: both channels stay IR_MODE_OFF, i.e. PWM_DIMx HIGH for
        good - the sensor's FLASH switches the LED through Q2/Q3. Only the CH0
@@ -642,6 +698,8 @@ void IR_LED_Task(void)
     ircut_task();
     ramp_task();
     fs_task();
+    hp_task();
+    hsp_task();
 
     for (int i = 0; i < IR_CH_COUNT; i++) {
         IR_ChannelState_t *c = &s_ch[i];
@@ -723,7 +781,7 @@ bool IR_LED_SetMode(IR_Channel_t ch, IR_LedMode_t mode)
 {
     if (ch >= IR_CH_COUNT) return false;
 
-#if (IR_FLASH_SYNC_ENABLE == 0)
+#if (IR_FLASH_SYNC_ENABLE == 0) || IR_PC3_OUTPUT
     if (mode == IR_MODE_FLASH_SYNC) {
         return false;   /* blocked: PC3 must not be used (IR_FLASH_SYNC_ENABLE) */
     }
@@ -1096,6 +1154,36 @@ static void fp_fire(bool from_vsync)
     }
     if (!any) return;
 
+    if (s_hp_mask != 0U) {
+        /* High-current pulse. Rate guard: whatever the trigger (TIM7, VSYNC
+           or both), never two pulses closer than IR_HP_MIN_SPACING_US - the
+           width limit assumes IR_FRAME_PULSE_FPS. Also never restart a
+           pulse that is still running. */
+        uint32_t now = IR_CYCCNT;
+        uint32_t min_cyc = IR_HP_MIN_SPACING_US * (SystemCoreClock / 1000000U);
+        bool fire = false;
+
+        if ((TIM12->CR1 & TIM_CR1_CEN) != 0U ||
+            (s_hp_any_fired && (now - s_hp_last_cyc) < min_cyc)) {
+            for (int i = 0; i < IR_CH_COUNT; i++) {
+                if (s_hp_mask & (1UL << i)) s_hp_skipped[i]++;
+            }
+            return;
+        }
+        for (int i = 0; i < IR_CH_COUNT; i++) {
+            if ((s_hp_mask & (1UL << i)) == 0U || s_hp_left[i] == 0U) continue;
+            if (s_hp_left[i] != IR_HP_ENDLESS) s_hp_left[i]--;
+            s_hp_fired[i]++;
+            fire = true;
+            /* Current up now; the gate opens at CNT = 1, 1us later. */
+            if (i == IR_CH0) DAC1->DHR12R1 = s_hp_code[i];
+            else             DAC1->DHR12R2 = s_hp_code[i];
+        }
+        if (!fire) return;          /* all hpulse bursts finished: stay dark */
+        s_hp_last_cyc  = now;
+        s_hp_any_fired = true;
+    }
+
     TIM12->CNT  = 0U;
     TIM12->CR1 |= TIM_CR1_CEN;
     s_fp_count++;
@@ -1143,6 +1231,146 @@ bool IR_LED_GetFramePulse(IR_Channel_t ch, uint32_t *width_us)
     if (ch >= IR_CH_COUNT) return false;
     if (width_us) *width_us = s_fp_width_us;
     return s_ch[ch].mode == IR_MODE_FRAME_PULSE;
+}
+
+/* ---------------------------------------------------------------------------
+   High-current pulse (USHIO 20A test) - see IR_LED_SetHighPulse() in the header
+   --------------------------------------------------------------------------- */
+
+#define IR_HP_TIM12_IRQ_PRIO  0U     /* the DAC drop ends the pulse current */
+
+/* TIM12 update = end of the one-pulse: the gate has just closed in hardware;
+   drop every hpulse DAC to 0 V so a high FLASH cannot light the LED at the
+   pulse current between pulses. */
+void TIM12_IRQHandler(void)
+{
+    if (TIM12->SR & TIM_SR_UIF) {
+        TIM12->SR = ~TIM_SR_UIF;
+        if (s_hp_mask & 1U) DAC1->DHR12R1 = 0U;
+        if (s_hp_mask & 2U) DAC1->DHR12R2 = 0U;
+        hsp_timer_cut();
+    }
+}
+
+uint32_t IR_LED_HighPulseMaxWidth_us(uint32_t milliamps)
+{
+    const float period_us = 1000000.0f / (float)IR_FRAME_PULSE_FPS;
+    float duty;
+
+    if (milliamps == 0U) return IR_FRAME_PULSE_MAX_US;
+    if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
+    if (milliamps <= IR_LED_HARD_LIMIT_MA) return IR_FRAME_PULSE_MAX_US;
+
+    /* duty = 1% * (20A / I) ^ (ln 100 / ln 5): the datasheet's pulse-duration
+       curve, a straight log-log line from 20A at 1% to 4A at 100%. */
+    duty = 0.01f * powf(20000.0f / (float)milliamps, logf(100.0f) / logf(5.0f));
+    duty = duty * (float)IR_HP_DERATE_PCT / 100.0f;
+
+    float w = duty * period_us;
+    if (w > (float)IR_FRAME_PULSE_MAX_US) return IR_FRAME_PULSE_MAX_US;
+    if (w < 1.0f) return 1U;
+    return (uint32_t)w;          /* truncate: never round up past the curve */
+}
+
+/* Ends hpulse on ch: interrupt off if no channel needs it, DAC to 0 V. Mode
+   handling is the caller's (apply_channel / IR_LED_StopHighPulse). */
+static void hp_clear(IR_Channel_t ch)
+{
+    s_hp_mask &= ~(1UL << ch);
+    s_hp_left[ch] = 0U;
+    if (s_hp_mask == 0U) {
+        TIM12->DIER &= ~TIM_DIER_UIE;
+    }
+    DAC1_SetValue(s_ch[ch].dac_channel, 0U);
+    s_ch[ch].raw_code = 0U;
+}
+
+bool IR_LED_SetHighPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t width_us, uint32_t count)
+{
+    uint32_t max_w;
+    uint16_t code;
+
+    if (ch >= IR_CH_COUNT) return false;
+    if (milliamps == 0U || width_us == 0U) {
+        IR_LED_StopHighPulse(ch);
+        return true;
+    }
+    if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
+    max_w = IR_LED_HighPulseMaxWidth_us(milliamps);
+    if (width_us > max_w) width_us = max_w;
+
+    /* Round the code DOWN so the pulse never exceeds the requested current. */
+    code = ma_to_code(milliamps);
+    while (code > 0U && mv_to_ma(code_to_mv(code)) > milliamps) code--;
+
+    /* Out of every other gate/DAC mode: FLASH gate, strobe, PWM, DAC PWM,
+       ramp, DAC test. PWM_DIMx parks HIGH, DC setpoint 0. */
+    IR_LED_StopRamp(ch);
+    (void)IR_LED_SetDacPwm(ch, IR_DAC_PWM_MIN_HZ, 0U);
+    (void)IR_LED_SetPwmLevel(ch, true);
+    IR_LED_SetCurrentRaw(ch, 0U);
+
+    __disable_irq();
+    s_hp_code[ch]    = code;
+    s_hp_left[ch]    = (count == 0U) ? IR_HP_ENDLESS : count;
+    s_hp_fired[ch]   = 0U;
+    s_hp_skipped[ch] = 0U;
+    s_hp_mask       |= (1UL << ch);
+    __enable_irq();
+
+    if (!IR_LED_SetFramePulse(ch, width_us)) {
+        IR_LED_StopHighPulse(ch);
+        return false;
+    }
+    /* fp_apply() has just written SR = 0 after its UG, so no stale update
+       is pending when the interrupt is enabled. */
+    TIM12->DIER |= TIM_DIER_UIE;
+    HAL_NVIC_SetPriority(TIM12_IRQn, IR_HP_TIM12_IRQ_PRIO, 0);
+    HAL_NVIC_EnableIRQ(TIM12_IRQn);
+    return true;
+}
+
+void IR_LED_StopHighPulse(IR_Channel_t ch)
+{
+    if (ch >= IR_CH_COUNT) return;
+    if ((s_hp_mask & (1UL << ch)) == 0U) return;
+    hp_clear(ch);
+    (void)IR_LED_SetFramePulse(ch, 0U);       /* mode OFF, gate back to GPIO */
+}
+
+bool IR_LED_GetHighPulse(IR_Channel_t ch, uint32_t *ma, uint32_t *width_us,
+                         uint32_t *left, uint32_t *fired, uint32_t *skipped)
+{
+    if (ch >= IR_CH_COUNT || (s_hp_mask & (1UL << ch)) == 0U) return false;
+    if (ma)       *ma       = mv_to_ma(code_to_mv(s_hp_code[ch]));
+    if (width_us) *width_us = s_fp_width_us;
+    if (left)     *left     = (s_hp_left[ch] == IR_HP_ENDLESS) ? 0U : s_hp_left[ch];
+    if (fired)    *fired    = s_hp_fired[ch];
+    if (skipped)  *skipped  = s_hp_skipped[ch];
+    return true;
+}
+
+/* Runs from IR_LED_Task(). Belt and braces for the hpulse DAC: whenever no
+   pulse is in flight, a DAC above the 4A hard-cap code is an error (missed
+   or late ISR) - force it to 0 V. Also retires finished bursts. */
+static void hp_task(void)
+{
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        IR_Channel_t ch = (IR_Channel_t)i;
+        if (s_dactest[i]) continue;                    /* explicit bench override */
+        /* IRQs off: fp_fire() raises the DAC and starts TIM12 in one ISR, so
+           this check cannot land between the two and cut a live pulse. */
+        __disable_irq();
+        if ((TIM12->CR1 & TIM_CR1_CEN) == 0U &&
+            DAC1_GetValue(s_ch[i].dac_channel) > hard_limit_code()) {
+            DAC1_SetValue(s_ch[i].dac_channel, 0U);
+        }
+        __enable_irq();
+        if ((s_hp_mask & (1UL << i)) != 0U && s_hp_left[i] == 0U &&
+            (TIM12->CR1 & TIM_CR1_CEN) == 0U) {
+            IR_LED_StopHighPulse(ch);
+        }
+    }
 }
 
 uint32_t IR_LED_GetFramePulseCount(void) { return s_fp_count; }
@@ -1317,7 +1545,7 @@ static void fs_sync_running(void)
         if (s_ch[i].mode == IR_MODE_FLASH_SYNC) want = true;
     }
     want = want && s_master_enable;
-#if (IR_FLASH_SYNC_ENABLE == 0)
+#if (IR_FLASH_SYNC_ENABLE == 0) || IR_PC3_OUTPUT
     want = false;                   /* blocked: never start ADC1 on PC3 */
 #endif
 
@@ -1544,10 +1772,559 @@ static volatile uint32_t s_gate_inv_pins  = 0U;   /* gated channels with inverte
                                                      HIGH while FLASH is low, LOW while high */
 static uint32_t          s_pwm_duty_req[IR_CH_COUNT] = {0U, 0U};   /* requested duty % */
 
+/* ---------------------------------------------------------------------------
+   HSYNC pulse (USHIO 20A test) - see IR_LED_SetHsyncPulse() in the header
+   --------------------------------------------------------------------------- */
+
+/* OFF: not set up. WAIT: between windows, DAC 0 V, waiting for VSYNC.
+   ARMED: VSYNC seen, waiting for line start-1. PRE: DAC up, gate still off
+   (the pre-line gives the LT3763 the DAC step before the first HIGH).
+   ACTIVE: gate follows HSYNC level. */
+enum { HSP_OFF = 0, HSP_WAIT, HSP_ARMED, HSP_PRE, HSP_ACTIVE };
+#define IR_HSP_MARGIN_US      3U
+#define IR_HSP_TIM12_IRQ_PRIO 0U     /* the cut-off ends the pulse current */
+
+static volatile uint32_t s_hsp_state  = HSP_OFF;
+static IR_Channel_t      s_hsp_ch     = IR_CH0;
+static volatile uint16_t s_hsp_code   = 0U;
+static volatile uint32_t s_hsp_start  = 0U;
+static volatile uint32_t s_hsp_lines  = 0U;
+static volatile uint32_t s_hsp_left   = 0U;      /* IR_HP_ENDLESS = continuous */
+static volatile uint32_t s_hsp_fired  = 0U;
+static volatile uint32_t s_hsp_cuts   = 0U;
+static volatile uint32_t s_hsp_window_us = 0U;
+static volatile uint32_t s_hsp_high_cyc  = 0U;
+static volatile bool     s_hsp_vs_mode   = false;  /* true: LED on while VSYNC is LOW */
+static volatile bool     s_hsp_solid     = false;  /* line window: solid ON, ignore HSYNC LOW */
+static volatile uint32_t s_hsp_vs_fall   = 0U;     /* DWT at the last VSYNC fall */
+static volatile uint32_t s_hsp_vs_low_cyc = 0U;
+static volatile uint32_t s_hsp_last_begin = 0U;    /* DWT, for the rate guard */
+static volatile bool     s_hsp_begun     = false;
+static volatile uint32_t s_hsp_skipped   = 0U;
+static volatile bool     s_hsp_flash     = false;  /* gate on FLASH (PC3 driven) instead of PWM_DIMx */
+static volatile bool     s_hsp_inv       = false;  /* inv: gate on during HSYNC LOW (PC3 HIGH / PWM_DIMx LOW) */
+static volatile bool     s_fx_inv_on     = false;  /* inv: gate currently on */
+static volatile uint32_t s_hsp_end_line  = 0U;     /* start + lines, for IR_LED_HsIrqFast() */
+static volatile uint32_t s_hsp_space_cyc = 0U;     /* IR_HP_MIN_SPACING_US in TIM5 ticks */
+
+/* fhsync timing check: TIM5 at EXTI1 (SN0_HS) handler entry, set in
+   stm32h5xx_it.c, against TIM5 right after each PC3 write. */
+volatile uint32_t        g_hs_irq_t = 0U;
+static volatile uint32_t s_fx_rise_min, s_fx_rise_max, s_fx_rise_sum, s_fx_rise_n;
+static volatile uint32_t s_fx_fall_min, s_fx_fall_max, s_fx_fall_sum, s_fx_fall_n;
+static volatile uint32_t s_fx_t_on, s_fx_high_cyc, s_fx_pulses, s_fx_pulses_last;
+static volatile uint32_t s_fx_pmin, s_fx_pmax;
+/* Rises the SN0_HS handler found pending on its way out of a fall, i.e.
+   that arrived while the fall was still being handled. */
+static volatile uint32_t s_fx_late = 0U;
+
+static void fx_reset(void)
+{
+    s_fx_rise_min = s_fx_fall_min = s_fx_pmin = 0xFFFFFFFFU;
+    s_fx_rise_max = s_fx_rise_sum = s_fx_rise_n = 0U;
+    s_fx_fall_max = s_fx_fall_sum = s_fx_fall_n = 0U;
+    s_fx_t_on = s_fx_high_cyc = s_fx_pulses = s_fx_pulses_last = s_fx_pmax = 0U;
+    s_fx_late = 0U;
+}
+
+static bool hsp_active(void) { return s_hsp_state != HSP_OFF; }
+
+IR_HOT static inline void hsp_dac(uint16_t code)
+{
+    if (s_hsp_ch == IR_CH0) DAC1->DHR12R1 = code;
+    else                    DAC1->DHR12R2 = code;
+}
+
+/* LED gate for the window: PWM_DIMx LOW, or in FLASH mode PC3 HIGH (Q2/Q3
+   pass FLASH, so FLASH HIGH lights the LED with PWM_DIMx HIGH). */
+static volatile bool s_fx_fast_on = false, s_fx_fast_off = false;   /* PC3 already written */
+
+IR_HOT static inline void hsp_led_on(void)
+{
+    if (s_hsp_inv) return;                                    /* IR_LED_HsIrqFast() owns the gate */
+    if (s_hsp_flash) {
+        if (s_hsp_inv) return;                                /* IR_LED_HsIrqFast() owns PC3 */
+        if (s_fx_fast_on) { s_fx_fast_on = false; return; }   /* IR_LED_HsIrqFast() did it */
+        FLASH_GPIO_Port->BSRR = FLASH_Pin;
+        uint32_t now = IR_CYCCNT, d = now - g_hs_irq_t;
+        s_fx_t_on = now;
+        s_fx_pulses++;
+        if (d < s_fx_rise_min) s_fx_rise_min = d;
+        if (d > s_fx_rise_max) s_fx_rise_max = d;
+        s_fx_rise_sum += d; s_fx_rise_n++;
+    } else {
+        PWM_DIM0_GPIO_Port->BSRR = (uint32_t)GATE_PIN(s_hsp_ch) << 16U;
+    }
+}
+
+IR_HOT static inline void hsp_led_off(void)
+{
+    if (s_hsp_inv) return;                                    /* IR_LED_HsIrqFast() owns the gate */
+    if (s_hsp_flash) {
+        if (s_hsp_inv) return;                                /* IR_LED_HsIrqFast() owns PC3 */
+        if (s_fx_fast_off) { s_fx_fast_off = false; return; }
+        FLASH_GPIO_Port->BSRR = (uint32_t)FLASH_Pin << 16U;
+        uint32_t now = IR_CYCCNT, d = now - g_hs_irq_t;
+        s_fx_high_cyc = now - s_fx_t_on;
+        if (d < s_fx_fall_min) s_fx_fall_min = d;
+        if (d > s_fx_fall_max) s_fx_fall_max = d;
+        s_fx_fall_sum += d; s_fx_fall_n++;
+    } else {
+        PWM_DIM0_GPIO_Port->BSRR = GATE_PIN(s_hsp_ch);
+    }
+}
+
+/* First thing in EXTI1_IRQHandler (SN0_HS), fhsync only: writes PC3 (and
+   the DAC) for this edge before the HAL dispatch and line bookkeeping, which
+   had put PC3 ~5 us behind the HSYNC rise and ~2 us behind the fall. It
+   makes the same decision hsp_on_rise()/hsp_on_fall() make just after it -
+   in the window, or the first line of a window hsp_begin() will accept -
+   and those then skip their own PC3 write. Stats: from handler entry. */
+IR_HOT void IR_LED_HsIrqFast(bool rise, bool late)
+{
+    if (!s_hsp_flash && !s_hsp_inv) return;
+    uint32_t st = s_hsp_state;
+    if (s_hsp_inv) {
+        /* Gate on through the LOW gap after each window line (line
+           start..end-1, numbered at its rise), off from the next rise: PC3
+           HIGH (fhsync inv) or PWM_DIMx LOW (hsync inv). Falls are only
+           enabled while ACTIVE. */
+        if (!rise) {
+            uint32_t line = s_hs_count - s_hs_at_vs;         /* line this LOW belongs to */
+            if (st != HSP_ACTIVE || line >= s_hsp_end_line) return;
+            hsp_dac(s_hsp_code);                             /* current up, then */
+            if (s_hsp_flash) FLASH_GPIO_Port->BSRR = FLASH_Pin;                       /* PC3 HIGH */
+            else             PWM_DIM0_GPIO_Port->BSRR = (uint32_t)GATE_PIN(s_hsp_ch) << 16U;  /* PWM LOW */
+            uint32_t now = IR_CYCCNT, d = now - g_hs_irq_t;
+            s_fx_inv_on = true;
+            s_fx_t_on = now;
+            s_fx_pulses++;
+            if (d < s_fx_rise_min) s_fx_rise_min = d;
+            if (d > s_fx_rise_max) s_fx_rise_max = d;
+            s_fx_rise_sum += d; s_fx_rise_n++;
+        } else if (s_fx_inv_on) {
+            if (s_hsp_flash) FLASH_GPIO_Port->BSRR = (uint32_t)FLASH_Pin << 16U;      /* PC3 LOW */
+            else             PWM_DIM0_GPIO_Port->BSRR = GATE_PIN(s_hsp_ch);           /* PWM HIGH */
+            hsp_dac(0U);                                     /* then current down */
+            s_fx_inv_on = false;
+            uint32_t now = IR_CYCCNT, d = now - g_hs_irq_t;
+            s_fx_high_cyc = now - s_fx_t_on;
+            if (late) s_fx_late++;
+            if (d < s_fx_fall_min) s_fx_fall_min = d;
+            if (d > s_fx_fall_max) s_fx_fall_max = d;
+            s_fx_fall_sum += d; s_fx_fall_n++;
+        }
+        return;
+    }
+    if (rise) {
+        uint32_t line = s_hs_count + 1U - s_hs_at_vs;       /* count not yet bumped */
+        bool on = false;
+        if (st == HSP_ACTIVE) {
+            on = (line < s_hsp_end_line);
+        } else if (st == HSP_ARMED && line == s_hsp_start) {
+            on = !s_hsp_begun || (IR_CYCCNT - s_hsp_last_begin) >= s_hsp_space_cyc;
+        }
+        if (!on) return;
+        hsp_dac(s_hsp_code);                                 /* current up, then */
+        FLASH_GPIO_Port->BSRR = FLASH_Pin;                   /* PC3 HIGH */
+        uint32_t now = IR_CYCCNT, d = now - g_hs_irq_t;
+        s_fx_fast_on = true;
+        s_fx_t_on = now;
+        s_fx_pulses++;
+        if (late) s_fx_late++;
+        if (d < s_fx_rise_min) s_fx_rise_min = d;
+        if (d > s_fx_rise_max) s_fx_rise_max = d;
+        s_fx_rise_sum += d; s_fx_rise_n++;
+    } else if (st == HSP_ACTIVE) {
+        FLASH_GPIO_Port->BSRR = (uint32_t)FLASH_Pin << 16U;  /* PC3 LOW, then */
+        hsp_dac(0U);                                         /* current down */
+        uint32_t now = IR_CYCCNT, d = now - g_hs_irq_t;
+        s_fx_fast_off = true;
+        s_fx_high_cyc = now - s_fx_t_on;
+        if (d < s_fx_fall_min) s_fx_fall_min = d;
+        if (d > s_fx_fall_max) s_fx_fall_max = d;
+        s_fx_fall_sum += d; s_fx_fall_n++;
+    }
+}
+
+/* PC3 for the FLASH-gated hsync mode ONLY - user-approved 2026-10-14 with
+   the sensor's FLASH output disabled. out: push-pull LOW, FLASH EXTI masked
+   (our own edges must not run the gate/strobe/monitor). !out: LOW, then back
+   to the boot input with both-edge interrupt. */
+static void hsp_flash_pin(bool out)
+{
+    GPIO_InitTypeDef init = {0};
+    FLASH_GPIO_Port->BSRR = (uint32_t)FLASH_Pin << 16U;
+    init.Pin  = FLASH_Pin;
+    init.Pull = GPIO_NOPULL;
+    if (out) {
+        EXTI->IMR1 &= ~FLASH_Pin;
+        init.Mode  = GPIO_MODE_OUTPUT_PP;
+        init.Speed = GPIO_SPEED_FREQ_MEDIUM;
+        HAL_GPIO_Init(FLASH_GPIO_Port, &init);
+    } else {
+        init.Mode = GPIO_MODE_IT_RISING_FALLING;
+        HAL_GPIO_Init(FLASH_GPIO_Port, &init);
+        EXTI->RPR1 = FLASH_Pin;
+        EXTI->FPR1 = FLASH_Pin;
+    }
+}
+
+/* End of a window (HSYNC, TIM12 cut-off, VSYNC overrun or stop): gate off,
+   DAC 0 V, falling-edge interrupt and timer off. Interrupt context safe. */
+IR_HOT static void hsp_end(void)
+{
+    if (s_hsp_flash) FLASH_GPIO_Port->BSRR = (uint32_t)FLASH_Pin << 16U;  /* FLASH LOW */
+    if (s_hsp_flash || s_hsp_inv) {
+        s_fx_fast_on = s_fx_fast_off = false;
+        if (s_fx_pulses != 0U) {                              /* gate pulses this window */
+            s_fx_pulses_last = s_fx_pulses;
+            if (s_fx_pulses < s_fx_pmin) s_fx_pmin = s_fx_pulses;
+            if (s_fx_pulses > s_fx_pmax) s_fx_pmax = s_fx_pulses;
+            s_fx_pulses = 0U;
+        }
+    }
+    PWM_DIM0_GPIO_Port->BSRR = GATE_PIN(s_hsp_ch);          /* LED off */
+    hsp_dac(0U);
+    s_fx_inv_on = false;
+    EXTI->FTSR1 &= ~SN0_HS_Pin;
+    TIM12->CR1  &= ~TIM_CR1_CEN;
+    s_hsp_state = HSP_WAIT;
+}
+
+/* Starts a pulse unless the last one began less than IR_HP_MIN_SPACING_US
+   ago - the derating assumes at most IR_FRAME_PULSE_FPS pulses a second,
+   so a glitching sync input must not raise the rate. */
+IR_HOT static bool hsp_begin(void)
+{
+    uint32_t now = IR_CYCCNT;
+    if (s_hsp_begun && (now - s_hsp_last_begin) < s_hsp_space_cyc) {
+        s_hsp_skipped++;
+        return false;
+    }
+    s_hsp_last_begin = now;
+    s_hsp_begun      = true;
+    if (s_hsp_left != IR_HP_ENDLESS) s_hsp_left--;
+    s_hsp_fired++;
+    hsp_dac(s_hsp_code);
+    TIM12->CNT  = 0U;
+    TIM12->SR   = 0U;
+    TIM12->CR1 |= TIM_CR1_CEN;                               /* cut-off running */
+    s_hsp_state = HSP_PRE;
+    return true;
+}
+
+/* SN0_VS rising, s_hs_at_vs already updated. */
+static void hsp_on_vsync(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    if (s_hsp_state == HSP_PRE || s_hsp_state == HSP_ACTIVE) hsp_end();
+    if (s_hsp_vs_mode) {                                     /* end of the LOW pulse */
+        s_hsp_vs_low_cyc = IR_CYCCNT - s_hsp_vs_fall;
+        __set_PRIMASK(pm);
+        return;
+    }
+    if (s_hsp_state == HSP_WAIT && s_hsp_left != 0U) {
+        s_hsp_state = HSP_ARMED;
+        if (s_hsp_solid && s_hsp_start == 1U) hsp_begin();   /* pre-line = VSYNC */
+    }
+    __set_PRIMASK(pm);
+}
+
+/* SN0_HS rising; line = 1 for the first HSYNC after VSYNC. */
+IR_HOT static void hsp_on_rise(uint32_t line)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    uint32_t st = s_hsp_state;
+    if (st == HSP_ARMED && !s_hsp_solid) {
+        /* hsync: no pre-line - DAC and gate both follow HSYNC from line start. */
+        if (line == s_hsp_start && hsp_begin()) {
+            EXTI->FPR1   = SN0_HS_Pin;                       /* no stale fall */
+            EXTI->FTSR1 |= SN0_HS_Pin;
+            if (s_hsp_inv) hsp_dac(0U);                      /* inv: up at the fall */
+            hsp_led_on();                                    /* LED on */
+            s_hsp_state  = HSP_ACTIVE;
+        } else if (s_fx_fast_on) {                           /* fast path raised it: undo */
+            FLASH_GPIO_Port->BSRR = (uint32_t)FLASH_Pin << 16U;
+            hsp_dac(0U);
+            s_fx_fast_on = false;
+        }
+    } else if (st == HSP_ARMED) {
+        if (line + 1U == s_hsp_start) hsp_begin();
+    } else if (st == HSP_ACTIVE && !s_hsp_solid) {
+        if (line >= s_hsp_start + s_hsp_lines) {
+            hsp_end();
+        } else if (!s_hsp_inv) {
+            hsp_dac(s_hsp_code);                             /* current up, then */
+            hsp_led_on();                                    /* LED on */
+        }
+    } else if (st == HSP_PRE || st == HSP_ACTIVE) {
+        if (line >= s_hsp_start + s_hsp_lines) {
+            hsp_end();
+        } else if (line >= s_hsp_start) {
+            if (st == HSP_PRE) {
+                if (!s_hsp_solid) {                          /* follow HSYNC level */
+                    EXTI->FPR1   = SN0_HS_Pin;               /* no stale fall */
+                    EXTI->FTSR1 |= SN0_HS_Pin;
+                }
+                s_hsp_state  = HSP_ACTIVE;
+            }
+            hsp_led_on();                                    /* LED on */
+        }
+    }
+    __set_PRIMASK(pm);
+}
+
+/* SN0_VS falling - only enabled in VSYNC-LOW mode: current up, LED on. */
+static void hsp_on_vs_fall(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    s_hsp_vs_fall = IR_CYCCNT;
+    if (s_hsp_vs_mode && s_hsp_state == HSP_WAIT && s_hsp_left != 0U && hsp_begin()) {
+        hsp_led_on();                                    /* LED on */
+        s_hsp_state = HSP_ACTIVE;
+    }
+    __set_PRIMASK(pm);
+}
+
+/* SN0_HS falling - only enabled while ACTIVE. */
+IR_HOT static void hsp_on_fall(void)
+{
+    if (s_hsp_state == HSP_ACTIVE) {
+        hsp_led_off();                                       /* LED off, then */
+        if (!s_hsp_solid) hsp_dac(0U);                       /* current down */
+    }
+    s_hsp_high_cyc = IR_CYCCNT - s_hs_last;
+}
+
+/* TIM12 update: the cut-off expired with the window still open. */
+static void hsp_timer_cut(void)
+{
+    if (s_hsp_state == HSP_PRE || s_hsp_state == HSP_ACTIVE) {
+        hsp_end();
+        s_hsp_cuts++;
+    }
+}
+
+/* Shared set-up for hsync and vsync pulses: frees TIM12 and the channel,
+   programs the cut-off and arms the engine in WAIT. */
+static void hsp_setup(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                      uint32_t lines, uint32_t count, uint32_t window, bool vs_mode, bool solid,
+                      bool flash, bool inv)
+{
+    uint16_t code;
+
+    code = ma_to_code(milliamps);
+    while (code > 0U && mv_to_ma(code_to_mv(code)) > milliamps) code--;
+
+    /* Free TIM12 and the channel: hpulse on both, the other channel's TIM12
+       mode, and every DAC/gate mode on this one. PWM_DIMx HIGH, DC 0. */
+    IR_LED_StopHighPulse(IR_CH0);
+    IR_LED_StopHighPulse(IR_CH1);
+    for (int i = 0; i < IR_CH_COUNT; i++) {
+        if (s_ch[i].mode == IR_MODE_GATE_PWM || s_ch[i].mode == IR_MODE_FRAME_PULSE) {
+            (void)IR_LED_SetMode((IR_Channel_t)i, IR_MODE_OFF);
+        }
+    }
+    IR_LED_StopRamp(ch);
+    (void)IR_LED_SetDacPwm(ch, IR_DAC_PWM_MIN_HZ, 0U);
+    (void)IR_LED_SetPwmLevel(ch, true);
+    IR_LED_SetCurrentRaw(ch, 0U);
+
+    /* TIM12 as a bare one-pulse timer: 1 us ticks, no outputs, URS so the
+       UG below cannot raise UIF. */
+    __HAL_RCC_TIM12_CLK_ENABLE();
+    TIM12->CR1   = 0U;
+    TIM12->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E);
+    TIM12->PSC   = (uint16_t)(IR_TICKS_PER_US - 1U);
+    TIM12->ARR   = (uint16_t)window;
+    TIM12->CR1   = TIM_CR1_OPM | TIM_CR1_URS;
+    TIM12->EGR   = TIM_EGR_UG;
+    TIM12->SR    = 0U;
+    TIM12->DIER  = TIM_DIER_UIE;
+    HAL_NVIC_SetPriority(TIM12_IRQn, IR_HSP_TIM12_IRQ_PRIO, 0);
+    HAL_NVIC_EnableIRQ(TIM12_IRQn);
+    if (flash) hsp_flash_pin(true);
+    fx_reset();
+
+    __disable_irq();
+    s_hsp_flash     = flash;
+    s_hsp_inv       = inv && !vs_mode && !solid;
+    s_fx_inv_on     = false;
+    s_hsp_vs_mode   = vs_mode;
+    s_hsp_solid     = solid;
+    s_hsp_vs_low_cyc = 0U;
+    s_hsp_begun     = false;
+    s_hsp_skipped   = 0U;
+    s_hsp_ch        = ch;
+    s_hsp_code      = code;
+    s_hsp_start     = start_line;
+    s_hsp_lines     = lines;
+    s_hsp_end_line  = start_line + lines;
+    s_hsp_space_cyc = IR_HP_MIN_SPACING_US * (SystemCoreClock / 1000000U);
+    s_hsp_left      = (count == 0U) ? IR_HP_ENDLESS : count;
+    s_hsp_fired     = 0U;
+    s_hsp_cuts      = 0U;
+    s_hsp_window_us = window;
+    s_hsp_high_cyc  = 0U;
+    s_hsp_state     = HSP_WAIT;                 /* arms on the next VSYNC */
+    if (vs_mode) {
+        EXTI->FPR1   = SN0_VS_Pin;
+        EXTI->FTSR1 |= SN0_VS_Pin;              /* VSYNC fall starts each pulse */
+    }
+    __enable_irq();
+}
+
+static bool line_pulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                       uint32_t lines, uint32_t count, bool solid, bool flash, bool inv)
+{
+    uint32_t cyc_per_us = SystemCoreClock / 1000000U;
+    uint32_t line_us, budget, max_lines, window;
+
+    if (ch >= IR_CH_COUNT) return false;
+    IR_LED_StopHsyncPulse(IR_CH0);
+    IR_LED_StopHsyncPulse(IR_CH1);
+    if (milliamps == 0U || lines == 0U || start_line == 0U) return true;
+    if (flash && s_fs_running) return false;            /* ADC owns PC3 (analog) */
+
+    /* HSYNC must be running now: an edge within the last 1 ms. */
+    if (s_hs_period_cyc == 0U || (IR_CYCCNT - s_hs_last) > 1000U * cyc_per_us) return false;
+    /* Line period averaged over the last frame (VSYNC period / lines); one
+       HS-to-HS sample carries the EXTI latency jitter (seen 14.3..18 us). */
+    {
+        uint32_t per_cyc = s_hs_period_cyc;
+        if (s_vs_period_cyc != 0U && s_hs_per_frame != 0U) per_cyc = s_vs_period_cyc / s_hs_per_frame;
+        line_us = (per_cyc + cyc_per_us - 1U) / cyc_per_us;              /* round up */
+    }
+    if (line_us == 0U) return false;
+
+    if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
+    budget = IR_LED_HighPulseMaxWidth_us(milliamps);
+    /* At or below the LED's DC rating (IR_LED_HARD_LIMIT_MA) there is no
+       per-frame limit, so a window may cover every line of the frame (user,
+       2026-10-14: one pulse per HSYNC, 2233 per frame). The next VSYNC ends
+       the window (hsp_on_vsync); TIM12 - 16-bit, 1 us ticks - only backs it
+       up if VSYNC is lost. Above it the derating budget applies as before. */
+    if (milliamps <= IR_LED_HARD_LIMIT_MA) budget = 0xFFFFU;
+    {
+        uint32_t pre = solid ? 1U : 0U;                                  /* solid: + pre-line */
+        if (budget <= IR_HSP_MARGIN_US + (pre + 1U) * line_us) return false;
+        max_lines = (budget - IR_HSP_MARGIN_US) / line_us - pre;
+        if (lines > max_lines) lines = max_lines;
+        window = (lines + pre) * line_us + IR_HSP_MARGIN_US;             /* <= budget */
+    }
+
+    hsp_setup(ch, milliamps, start_line, lines, count, window, false, solid, flash, inv);
+    return true;
+}
+
+bool IR_LED_SetHsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                          uint32_t lines, uint32_t count)
+{
+    return line_pulse(ch, milliamps, start_line, lines, count, false, false, false);
+}
+
+bool IR_LED_SetHsyncLowPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                             uint32_t lines, uint32_t count)
+{
+    return line_pulse(ch, milliamps, start_line, lines, count, false, false, true);
+}
+
+bool IR_LED_SetHsyncFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                               uint32_t lines, uint32_t count, bool inv)
+{
+    return line_pulse(ch, milliamps, start_line, lines, count, false, true, inv);
+}
+
+bool IR_LED_SetVsyncLinePulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
+                              uint32_t lines, uint32_t count)
+{
+    return line_pulse(ch, milliamps, start_line, lines, count, true, false, false);
+}
+
+bool IR_LED_SetVsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count)
+{
+    uint32_t window;
+
+    if (ch >= IR_CH_COUNT) return false;
+    IR_LED_StopHsyncPulse(IR_CH0);
+    IR_LED_StopHsyncPulse(IR_CH1);
+    if (milliamps == 0U) return true;
+
+    /* VSYNC must be running now: an edge within the last 100 ms. */
+    if (s_vs_count == 0U || (HAL_GetTick() - s_vs_last_ms) > 100U) return false;
+
+    if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
+    window = IR_LED_HighPulseMaxWidth_us(milliamps);
+    if (window > 0xFFFFU) window = 0xFFFFU;                              /* 16-bit ARR */
+    hsp_setup(ch, milliamps, 0U, 0U, count, window, true, false, false, false);
+    return true;
+}
+
+void IR_LED_StopHsyncPulse(IR_Channel_t ch)
+{
+    if (ch >= IR_CH_COUNT || s_hsp_state == HSP_OFF || ch != s_hsp_ch) return;
+    __disable_irq();
+    hsp_end();
+    EXTI->FTSR1 &= ~SN0_VS_Pin;
+    s_hsp_state = HSP_OFF;
+    if (s_hp_mask == 0U) TIM12->DIER &= ~TIM_DIER_UIE;
+    __enable_irq();
+    if (s_hsp_flash) {                          /* PC3 back to input */
+        hsp_flash_pin(IR_PC3_OUTPUT);           /* IMX568: input again; IMX678: output LOW */
+        s_hsp_flash = false;
+    }
+    s_ch[ch].raw_code = 0U;
+}
+
+bool IR_LED_GetHsyncPulse(IR_Channel_t ch, IR_HsyncPulseInfo_t *info)
+{
+    if (ch >= IR_CH_COUNT || s_hsp_state == HSP_OFF || ch != s_hsp_ch) return false;
+    if (info) {
+        uint32_t cyc_per_us = SystemCoreClock / 1000000U;
+        info->ma         = mv_to_ma(code_to_mv(s_hsp_code));
+        info->start_line = s_hsp_start;
+        info->lines      = s_hsp_lines;
+        info->window_us  = s_hsp_window_us;
+        info->left       = (s_hsp_left == IR_HP_ENDLESS) ? 0U : s_hsp_left;
+        info->fired      = s_hsp_fired;
+        info->timer_cuts = s_hsp_cuts;
+        info->hs_high_ns = (uint32_t)(((uint64_t)s_hsp_high_cyc * 1000U) / cyc_per_us);
+        info->vs_mode    = s_hsp_vs_mode;
+        info->solid      = s_hsp_solid;
+        info->vs_low_ns  = (uint32_t)(((uint64_t)s_hsp_vs_low_cyc * 1000U) / cyc_per_us);
+        info->skipped    = s_hsp_skipped;
+        info->flash      = s_hsp_flash;
+        info->inv        = s_hsp_inv;
+    }
+    return true;
+}
+
+/* Runs from IR_LED_Task(): retires a finished burst. */
+static void hsp_task(void)
+{
+    if (s_hsp_state == HSP_WAIT && s_hsp_left == 0U) IR_LED_StopHsyncPulse(s_hsp_ch);
+}
+
 /* The STM32H5 HAL dispatches EXTI through these two callbacks, never through
    HAL_GPIO_EXTI_Callback() below - so only FLASH is handled here. */
-void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
+IR_HOT void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 {
+    if (GPIO_Pin == SN0_HS_Pin) {            /* only enabled inside an hsync window */
+        /* fhsync: IR_LED_HsIrqFast() already did PC3 + DAC. HSYNC is LOW only
+           ~1.7 us, so nothing else may run here or the next rise is late. */
+        if (s_hsp_inv) return;
+        if (s_fx_fast_off) { s_fx_fast_off = false; return; }
+        hsp_on_fall();
+        return;
+    }
+    if (GPIO_Pin == SN0_VS_Pin) {            /* only enabled in vsync-LOW mode */
+        hsp_on_vs_fall();
+        return;
+    }
     if (GPIO_Pin != FLASH_Pin) return;
     if (s_dac_gate & 1U) DAC1->DHR12R1 = s_ch[IR_CH0].raw_code;   /* strobe: current up */
     if (s_dac_gate & 2U) DAC1->DHR12R2 = s_ch[IR_CH1].raw_code;
@@ -1556,24 +2333,25 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
         PWM_DIM0_GPIO_Port->BSRR = (norm << 16U) | inv;   /* normal LOW, inverted HIGH */
         s_gate_count++;
     }
-    uint32_t now = DWT->CYCCNT;
+    uint32_t now = IR_CYCCNT;
     if (s_fl_falls != 0U) s_fl_period_cyc = now - s_fl_last_fall;
     s_fl_last_fall    = now;
     s_fl_falls++;
     s_fl_last_edge_ms = HAL_GetTick();
 }
 
-void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
+IR_HOT void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == SN0_HS_Pin) {          /* ~65-130 kHz: keep this short */
-        uint32_t now = DWT->CYCCNT;
+        uint32_t now = IR_CYCCNT;
         s_hs_period_cyc = now - s_hs_last;
         s_hs_last = now;
         s_hs_count++;
+        if (s_hsp_state != HSP_OFF) hsp_on_rise(s_hs_count - s_hs_at_vs);
         return;
     }
     if (GPIO_Pin == SN0_VS_Pin) {
-        uint32_t now = DWT->CYCCNT;
+        uint32_t now = IR_CYCCNT;
         if (s_vs_count != 0U) {
             s_vs_period_cyc = now - s_vs_last;
             s_hs_per_frame  = s_hs_count - s_hs_at_vs;
@@ -1582,6 +2360,7 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
         s_hs_at_vs = s_hs_count;
         s_vs_count++;
         s_vs_last_ms = HAL_GetTick();
+        if (s_hsp_state != HSP_OFF) hsp_on_vsync();
         return;
     }
     if (GPIO_Pin != FLASH_Pin) return;
@@ -1591,7 +2370,7 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
     }
     if (s_dac_gate & 1U) DAC1->DHR12R1 = 0U;                     /* strobe: current to 0 */
     if (s_dac_gate & 2U) DAC1->DHR12R2 = 0U;
-    if (s_fl_falls != 0U) s_fl_low_cyc = DWT->CYCCNT - s_fl_last_fall;
+    if (s_fl_falls != 0U) s_fl_low_cyc = IR_CYCCNT - s_fl_last_fall;
     s_fl_last_edge_ms = HAL_GetTick();
 }
 
@@ -1624,6 +2403,9 @@ bool IR_LED_SetFlashGate(IR_Channel_t ch, bool on)
     uint32_t pin = GATE_PIN(ch);
 
     if (ch >= IR_CH_COUNT) return false;
+#if IR_PC3_OUTPUT
+    if (on) return false;                    /* IMX678: PC3 is an output, no FLASH to gate on */
+#endif
     if (on && ((s_gate_pins & ~pin) != 0U || other_can_be_low(ch))) {
         return false;                        /* check before touching the pin */
     }
@@ -1791,6 +2573,64 @@ void IR_LED_GetSyncInput(IR_SyncInput_t *in)
     /* HS alive if its count moved since the last call */
     in->hs_active      = (s_hs_count != s_hs_count_seen);
     s_hs_count_seen    = s_hs_count;
+}
+
+/* True HSYNC (PB1) HIGH/LOW times: polls the pin for ~1 ms with interrupts
+   off (no EXTI latency in the numbers), TIM5-timed. Refused while a pulse
+   mode runs - its edges must not be missed. ns: high min/avg/max, low
+   min/avg/max, number of full HIGH periods. */
+IR_HOT bool IR_LED_MeasureHsync(uint32_t d[7])
+{
+    if (s_hsp_state != HSP_OFF) return false;
+    uint32_t c = SystemCoreClock / 1000000U, lim = 1000U * c;
+    uint32_t hmin = ~0U, hmax = 0U, hsum = 0U, hn = 0U, lmin = ~0U, lmax = 0U, lsum = 0U, ln = 0U;
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    uint32_t t0 = IR_CYCCNT, last = 0U, tedge = 0U;
+    bool lvl = (SN0_HS_GPIO_Port->IDR & SN0_HS_Pin) != 0U, seen = false;
+    while ((IR_CYCCNT - t0) < lim) {
+        bool v = (SN0_HS_GPIO_Port->IDR & SN0_HS_Pin) != 0U;
+        if (v == lvl) continue;
+        uint32_t now = IR_CYCCNT;
+        if (seen) {
+            uint32_t w = now - tedge;
+            if (lvl) { if (w < hmin) hmin = w; if (w > hmax) hmax = w; hsum += w; hn++; }
+            else     { if (w < lmin) lmin = w; if (w > lmax) lmax = w; lsum += w; ln++; }
+        }
+        seen = true; tedge = now; lvl = v; last = now;
+    }
+    __set_PRIMASK(pm);
+    (void)last;
+    d[0] = hn ? hmin * 1000U / c : 0U; d[1] = hn ? (hsum / hn) * 1000U / c : 0U; d[2] = hmax * 1000U / c;
+    d[3] = ln ? lmin * 1000U / c : 0U; d[4] = ln ? (lsum / ln) * 1000U / c : 0U; d[5] = lmax * 1000U / c;
+    d[6] = hn;
+    return true;
+}
+
+bool IR_LED_GetFlashSyncStats(uint32_t d[12])
+{
+    if (s_hsp_state == HSP_OFF || (!s_hsp_flash && !s_hsp_inv)) return false;
+    uint32_t c = SystemCoreClock / 1000000U;      /* cycles per us -> ns below */
+    d[0] = s_fx_rise_n ? s_fx_rise_min * 1000U / c : 0U;
+    d[1] = s_fx_rise_n ? (s_fx_rise_sum / s_fx_rise_n) * 1000U / c : 0U;
+    d[2] = s_fx_rise_max * 1000U / c;
+    d[3] = s_fx_fall_n ? s_fx_fall_min * 1000U / c : 0U;
+    d[4] = s_fx_fall_n ? (s_fx_fall_sum / s_fx_fall_n) * 1000U / c : 0U;
+    d[5] = s_fx_fall_max * 1000U / c;
+    d[6] = s_fx_high_cyc * 1000U / c;            /* last PC3 HIGH */
+    d[7] = s_fx_pulses_last;
+    d[8] = (s_fx_pmin == 0xFFFFFFFFU) ? 0U : s_fx_pmin;
+    d[9] = s_fx_pmax;
+    d[10] = s_fx_rise_n;
+    d[11] = s_fx_late;
+    return true;
+}
+
+void IR_LED_GetSyncDebug(uint32_t d[6])
+{
+    d[0] = HAL_GetTick();     d[1] = s_vs_last_ms;
+    d[2] = s_vs_period_cyc;   d[3] = s_hs_period_cyc;
+    d[4] = SystemCoreClock;   d[5] = IR_CYCCNT;
 }
 
 void IR_LED_GetFlashInput(IR_FlashInput_t *in)

@@ -159,6 +159,11 @@ static void CLI_TxDrain(void)
 static void CLI_DisplayMenu(void) {
   CLI_Print("\r\n=================================\r\n");
   CLI_Print("   HARDWARE PWM CONSOLE TEST     \r\n");
+#if IR_PC3_OUTPUT
+  CLI_Print("   Sensor: IMX678 (PC3 output)   \r\n");
+#else
+  CLI_Print("   Sensor: IMX568 (PC3 input)    \r\n");
+#endif
   CLI_Print("=================================\r\n");
   CLI_Print("  help                  - Display this menu\r\n");
   CLI_Print("  <color>_on / _off     - e.g. red_on, green_off\r\n");
