@@ -587,6 +587,10 @@ typedef struct {
     bool     inv;           /* ... with inv: PC3 = NOT HSYNC */
     bool     fl_mode;       /* set up by IR_LED_SetFlashPulse() */
     uint32_t fl_low_ns;     /* flash mode: last measured FLASH LOW time */
+    bool     fl_pwm;        /* ... by IR_LED_SetFlashPwmPulse(): PWM inside the exposure */
+    uint32_t pwm_on_us;     /* fl_pwm: on-time per PWM period, last burst */
+    uint32_t pwm_period_us; /* fl_pwm: PWM period, last burst */
+    uint32_t pwm_pulses;    /* fl_pwm: PWM pulses in the last burst */
 } IR_HsyncPulseInfo_t;
 
 bool IR_LED_SetHsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
@@ -624,6 +628,27 @@ bool IR_LED_SetVsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count);
    set). False for a bad channel, no FLASH edges, FLASH ADC sync running or
    the IMX678 build. */
 bool IR_LED_SetFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *window_us);
+/* FLASH PWM PULSE (IMX568): as IR_LED_SetFlashPulse(), but instead of one
+   solid pulse cut at the derating width, PWM_DIMx is chopped by TIM12 (CH1
+   = PB14, CH2 = PB15, hardware PWM, active LOW) through the whole exposure,
+   so the same per-frame on-time budget - IR_LED_HighPulseMaxWidth_us(mA),
+   the USHIO curve at IR_FRAME_PULSE_FPS - is spread evenly over FLASH LOW
+   instead of lighting only its start. At each FLASH fall, from the last
+   measured FLASH LOW time T and budget B:
+       period P = IR_FLP_PERIOD_US, on = B * P / T   (capped at B and P)
+   and if on < IR_FLP_MIN_ON_US: on = IR_FLP_MIN_ON_US, P stretched to keep
+   the duty. B >= T means no chopping is needed: the pulse is solid. The
+   TIM12 update interrupt counts periods and the burst ends after B / on of
+   them (CCR preloaded to 0 for the period after the last, so no sliver),
+   or at the FLASH rise, whichever is first - the on-time per frame never
+   exceeds B even if FLASH stays low. The DAC stays at milliamps through the
+   burst: between PWM pulses FLASH is LOW and PWM_DIMx HIGH, so Q2/Q3 hold
+   IR_CTRLx low and the LED is dark; it drops to 0 V at the end. Same rate
+   guard, count, refusals and stop/report functions as the FLASH pulse
+   (info.fl_pwm set); *budget_us gets B. */
+#define IR_FLP_PERIOD_US            1000U
+#define IR_FLP_MIN_ON_US            10U
+bool IR_LED_SetFlashPwmPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *budget_us);
 /* VSYNC LINE PULSE: as IR_LED_SetHsyncPulse() (same line count from VSYNC,
    pre-line DAC step, derating clamp on lines, TIM12 cut-off) but the LED is
    held solid ON from line start_line to start_line + lines - 1 instead of

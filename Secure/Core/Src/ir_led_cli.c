@@ -25,7 +25,9 @@ static void print_help(IR_LED_CLI_PrintFn p)
     p("  ir [ch0|ch1] flash <mA> [n] - IMX568 LED pulse: on at <mA> (<=20 A) while FLASH is low\r\n");
     p("                            (exposure), cut off at the USHIO derating width (ir hpulse table);\r\n");
     p("                            n pulses (0 = continuous)\r\n");
-    p("  ir [ch0|ch1] flash on|off - repeat last flash settings (default 1000) / stop\r\n");
+    p("  ir [ch0|ch1] flash <mA> [n] pwm - as flash, but PWM_DIMx is chopped (TIM12, 1 kHz) through\r\n");
+    p("                            the exposure so the same per-frame on-time budget covers all of it\r\n");
+    p("  ir [ch0|ch1] flash on|off - repeat last flash settings (default 100) / stop\r\n");
     p("  ir [ch0|ch1] ramp <mA> <ms>  - Change current gradually to <mA> over <ms> (non-blocking)\r\n");
     p("  ir [ch0|ch1] dacpwm <hz> <duty%>|off - Chop DAC_DIMx between 0 V and the setpoint\r\n");
     p("  ir [ch0|ch1] dactest <0..1500 mV>|off - DAC test, BYPASSES the 4 A cap (unplug J5/J6!)\r\n");
@@ -188,8 +190,16 @@ static void print_status(IR_LED_CLI_PrintFn p)
             char cnt[24];
             if (hs.left) snprintf(cnt, sizeof(cnt), "%lu left", (unsigned long)hs.left);
             else         snprintf(cnt, sizeof(cnt), "continuous");
-            snprintf(l, sizeof(l), "  FLASH PULSE: %lu mA while FLASH LOW, cut-off %lu us, %s\r\n",
-                     (unsigned long)hs.ma, (unsigned long)hs.window_us, cnt);
+            if (hs.fl_pwm) {
+                snprintf(l, sizeof(l), "  FLASH PWM: %lu mA while FLASH LOW, budget %lu us/frame, %s\r\n",
+                         (unsigned long)hs.ma, (unsigned long)hs.window_us, cnt);
+                p(l);
+                snprintf(l, sizeof(l), "             last burst: %lu us on / %lu us period, %lu periods\r\n",
+                         (unsigned long)hs.pwm_on_us, (unsigned long)hs.pwm_period_us, (unsigned long)hs.pwm_pulses);
+            } else {
+                snprintf(l, sizeof(l), "  FLASH PULSE: %lu mA while FLASH LOW, cut-off %lu us, %s\r\n",
+                         (unsigned long)hs.ma, (unsigned long)hs.window_us, cnt);
+            }
             p(l);
             snprintf(l, sizeof(l), "               fired %lu, timer cut-offs %lu, skipped %lu, FLASH LOW %lu ns\r\n",
                      (unsigned long)hs.fired, (unsigned long)hs.timer_cuts, (unsigned long)hs.skipped,
@@ -558,9 +568,11 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
         char *end;
         long ma = strtol(a, &end, 10);
         long cnt = 0;
-        if (*end == ' ') cnt = strtol(end + 1, &end, 10);
+        bool pwm = false;
+        if (*end == ' ' && end[1] >= '0' && end[1] <= '9') cnt = strtol(end + 1, &end, 10);
+        if (strcmp(end, " pwm") == 0) { pwm = true; end += 4; }
         if (end == a || *end != '\0' || ma <= 0 || cnt < 0) {
-            print_fn("ERROR: usage 'ir [ch0|ch1] flash <mA> [n]' or 'flash on|off'\r\n"); return true;
+            print_fn("ERROR: usage 'ir [ch0|ch1] flash <mA> [n] [pwm]' or 'flash on|off'\r\n"); return true;
         }
         if ((uint32_t)ma > IR_LED_PULSE_LIMIT_MA) {
             snprintf(line, sizeof(line), "NOTE: clamped to the pulse limit of %lu mA\r\n", (unsigned long)IR_LED_PULSE_LIMIT_MA);
@@ -568,14 +580,29 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
             ma = (long)IR_LED_PULSE_LIMIT_MA;
         }
         uint32_t cut;
-        if (!IR_LED_SetFlashPulse(ch, (uint32_t)ma, (uint32_t)cnt, &cut)) {
+        bool ok = pwm ? IR_LED_SetFlashPwmPulse(ch, (uint32_t)ma, (uint32_t)cnt, &cut)
+                      : IR_LED_SetFlashPulse(ch, (uint32_t)ma, (uint32_t)cnt, &cut);
+        if (!ok) {
             print_fn("ERROR: FLASH (PC3) not toggling, or FLASH ADC sync running\r\n"); return true;
         }
-        snprintf(fl_last, sizeof(fl_last), "%ld %ld", ma, cnt);
+        snprintf(fl_last, sizeof(fl_last), "%ld %ld%s", ma, cnt, pwm ? " pwm" : "");
         IR_HsyncPulseInfo_t hs;
         IR_FlashInput_t fi;
         (void)IR_LED_GetHsyncPulse(ch, &hs);
         IR_LED_GetFlashInput(&fi);
+        if (pwm) {
+            snprintf(line, sizeof(line), "SUCCESS: ch%d FLASH PWM %lu mA while FLASH low, on-time budget %lu us per frame, %s\r\n", n,
+                     (unsigned long)hs.ma, (unsigned long)cut, cnt ? "counted" : "continuous");
+            print_fn(line);
+            if (fi.toggling && fi.low_us > cut) {
+                snprintf(line, sizeof(line), "NOTE: FLASH low %lu us - ~%lu %% PWM duty (%lu us period) spreads the budget over it\r\n",
+                         (unsigned long)fi.low_us, (unsigned long)((cut * 100U) / fi.low_us), (unsigned long)IR_FLP_PERIOD_US);
+            } else {
+                snprintf(line, sizeof(line), "NOTE: budget covers the whole exposure - pulse is solid, no chopping\r\n");
+            }
+            print_fn(line);
+            return true;
+        }
         snprintf(line, sizeof(line), "SUCCESS: ch%d FLASH pulse %lu mA while FLASH low, cut-off %lu us, %s\r\n", n,
                  (unsigned long)hs.ma, (unsigned long)cut, cnt ? "counted" : "continuous");
         print_fn(line);

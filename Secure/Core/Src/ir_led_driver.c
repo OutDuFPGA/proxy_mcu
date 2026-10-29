@@ -1799,6 +1799,13 @@ static volatile uint32_t s_hsp_high_cyc  = 0U;
 static volatile bool     s_hsp_vs_mode   = false;  /* true: LED on while VSYNC is LOW */
 static volatile bool     s_hsp_fl_mode   = false;  /* true: LED on while FLASH (PC3 in) is LOW */
 static volatile uint32_t s_hsp_fl_low_cyc = 0U;
+/* FLASH PWM pulse: TIM12 chops PWM_DIMx through the exposure. */
+static volatile bool     s_hsp_fl_pwm    = false;
+static volatile uint32_t s_flp_on_us     = 0U;     /* this burst */
+static volatile uint32_t s_flp_period_us = 0U;
+static volatile uint32_t s_flp_max       = 0U;     /* periods allowed by the budget */
+static volatile uint32_t s_flp_n         = 0U;     /* periods done in this burst */
+static volatile uint32_t s_flp_last      = 0U;     /* PWM pulses in the last burst */
 static volatile bool     s_hsp_solid     = false;  /* line window: solid ON, ignore HSYNC LOW */
 static volatile uint32_t s_hsp_vs_fall   = 0U;     /* DWT at the last VSYNC fall */
 static volatile uint32_t s_hsp_vs_low_cyc = 0U;
@@ -1843,8 +1850,69 @@ IR_HOT static inline void hsp_dac(uint16_t code)
    pass FLASH, so FLASH HIGH lights the LED with PWM_DIMx HIGH). */
 static volatile bool s_fx_fast_on = false, s_fx_fast_off = false;   /* PC3 already written */
 
+/* FLASH PWM: the gate pin's MODER - GPIO output (ODR, kept HIGH = LED off)
+   between bursts, TIM12 alternate function (AF2, set up once) during one. */
+#define FLP_MODER_OUT  1U
+#define FLP_MODER_AF   2U
+IR_HOT static inline void flp_gate_mode(IR_Channel_t ch, uint32_t mode)
+{
+    uint32_t pos = 2U * (uint32_t)__builtin_ctz(GATE_PIN(ch));
+    PWM_DIM0_GPIO_Port->MODER = (PWM_DIM0_GPIO_Port->MODER & ~(3UL << pos)) | (mode << pos);
+}
+
+IR_HOT static inline volatile uint32_t *flp_ccr(void)
+{
+    return (s_hsp_ch == IR_CH0) ? &TIM12->CCR1 : &TIM12->CCR2;
+}
+
+/* FLASH fall, before hsp_begin() starts TIM12: works out this burst from
+   the last FLASH LOW time and the budget (s_hsp_window_us), loads ARR/CCR.
+   The timer is stopped, so the UG below only reloads (URS: no update). */
+IR_HOT static void flp_load(void)
+{
+    uint32_t b = s_hsp_window_us, p = IR_FLP_PERIOD_US, on;
+    uint32_t t = s_fl_low_cyc / (SystemCoreClock / 1000000U);         /* exposure, us */
+
+    if (t == 0U || b >= t) {                                          /* budget covers it: solid */
+        on = p;
+    } else {
+        on = (b * p) / t;                                             /* b <= 33000, p <= 65535 */
+        if (on < IR_FLP_MIN_ON_US) {                                  /* keep the duty, stretch P */
+            on = IR_FLP_MIN_ON_US;
+            p  = (IR_FLP_MIN_ON_US * t + b - 1U) / b;
+            if (p > 0xFFFFU) p = 0xFFFFU;
+        }
+    }
+    if (on > b) on = b;
+    s_flp_on_us     = on;
+    s_flp_period_us = p;
+    s_flp_max       = b / ((on < p) ? on : p);                        /* >= 1: on <= b */
+    s_flp_n         = 0U;
+    TIM12->ARR  = (uint16_t)(p - 1U);
+    *flp_ccr()  = (on >= p) ? p : on;                                 /* CCR > ARR: on all period */
+    TIM12->EGR  = TIM_EGR_UG;                                         /* load the preloads */
+    if (s_flp_max <= 1U) *flp_ccr() = 0U;                             /* no 2nd pulse */
+}
+
+IR_HOT static void hsp_end(void);   /* fwd decl */
+
+/* TIM12 update in FLASH PWM: one period done. The period after the last
+   allowed one starts with CCR = 0 (preloaded one update early), so the
+   pulse train stops exactly at the budget; then the burst ends. */
+IR_HOT static void flp_on_update(void)
+{
+    if (s_hsp_state != HSP_ACTIVE) return;
+    uint32_t n = ++s_flp_n;
+    if (n + 1U == s_flp_max) *flp_ccr() = 0U;
+    if (n >= s_flp_max) {
+        hsp_end();
+        s_hsp_cuts++;                                                 /* budget used, FLASH still low */
+    }
+}
+
 IR_HOT static inline void hsp_led_on(void)
 {
+    if (s_hsp_fl_pwm) { flp_gate_mode(s_hsp_ch, FLP_MODER_AF); return; }   /* TIM12 drives the gate */
     if (s_hsp_inv) return;                                    /* IR_LED_HsIrqFast() owns the gate */
     if (s_hsp_flash) {
         if (s_hsp_inv) return;                                /* IR_LED_HsIrqFast() owns PC3 */
@@ -1989,6 +2057,10 @@ IR_HOT static void hsp_end(void)
         }
     }
     PWM_DIM0_GPIO_Port->BSRR = GATE_PIN(s_hsp_ch);          /* LED off */
+    if (s_hsp_fl_pwm) {                                       /* pin back to ODR = HIGH */
+        flp_gate_mode(s_hsp_ch, FLP_MODER_OUT);
+        s_flp_last = s_flp_n;
+    }
     hsp_dac(0U);
     s_fx_inv_on = false;
     EXTI->FTSR1 &= ~SN0_HS_Pin;
@@ -2100,9 +2172,12 @@ IR_HOT static void hsp_on_fl_fall(void)
 {
     uint32_t pm = __get_PRIMASK();
     __disable_irq();
-    if (s_hsp_state == HSP_WAIT && s_hsp_left != 0U && hsp_begin()) {
-        hsp_led_on();                                        /* LED on */
-        s_hsp_state = HSP_ACTIVE;
+    if (s_hsp_state == HSP_WAIT && s_hsp_left != 0U) {
+        if (s_hsp_fl_pwm) flp_load();                        /* ARR/CCR for this exposure */
+        if (hsp_begin()) {
+            hsp_led_on();                                    /* LED on (PWM: gate to TIM12) */
+            s_hsp_state = HSP_ACTIVE;
+        }
     }
     __set_PRIMASK(pm);
 }
@@ -2113,7 +2188,10 @@ IR_HOT static void hsp_on_fl_rise(void)
 {
     uint32_t pm = __get_PRIMASK();
     __disable_irq();
-    if (s_hsp_state == HSP_PRE || s_hsp_state == HSP_ACTIVE) hsp_end();
+    if (s_hsp_state == HSP_PRE || s_hsp_state == HSP_ACTIVE) {
+        if (s_hsp_fl_pwm) s_flp_n++;                         /* the period FLASH cut short */
+        hsp_end();
+    }
     s_hsp_fl_low_cyc = IR_CYCCNT - s_fl_last_fall;
     __set_PRIMASK(pm);
 }
@@ -2128,9 +2206,11 @@ IR_HOT static void hsp_on_fall(void)
     s_hsp_high_cyc = IR_CYCCNT - s_hs_last;
 }
 
-/* TIM12 update: the cut-off expired with the window still open. */
+/* TIM12 update: the cut-off expired with the window still open - or, in
+   FLASH PWM, one PWM period ended. */
 static void hsp_timer_cut(void)
 {
+    if (s_hsp_fl_pwm) { flp_on_update(); return; }
     if (s_hsp_state == HSP_PRE || s_hsp_state == HSP_ACTIVE) {
         hsp_end();
         s_hsp_cuts++;
@@ -2141,7 +2221,7 @@ static void hsp_timer_cut(void)
    programs the cut-off and arms the engine in WAIT. */
 static void hsp_setup(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
                       uint32_t lines, uint32_t count, uint32_t window, bool vs_mode, bool solid,
-                      bool flash, bool inv, bool fl_mode)
+                      bool flash, bool inv, bool fl_mode, bool fl_pwm)
 {
     uint16_t code;
 
@@ -2173,6 +2253,30 @@ static void hsp_setup(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
     TIM12->EGR   = TIM_EGR_UG;
     TIM12->SR    = 0U;
     TIM12->DIER  = TIM_DIER_UIE;
+    if (fl_pwm) {
+        /* FLASH PWM: TIM12 free-running instead of one-pulse, PWM mode 1 with
+           CCR preload, output active LOW (LED on while CNT < CCR). The gate
+           pin gets AF2 now but stays a GPIO output (HIGH) until a burst
+           switches its MODER (flp_gate_mode). */
+        uint32_t pin = (uint32_t)__builtin_ctz(GATE_PIN(ch)), sh = (pin & 7U) * 4U;
+        PWM_DIM0_GPIO_Port->AFR[pin >> 3] = (PWM_DIM0_GPIO_Port->AFR[pin >> 3] & ~(0xFUL << sh))
+                                          | ((uint32_t)GPIO_AF2_TIM12 << sh);
+        TIM12->CR1 = TIM_CR1_URS;
+        if (ch == IR_CH0) {
+            TIM12->CCMR1 = (TIM12->CCMR1 & ~(TIM_CCMR1_OC1M | TIM_CCMR1_CC1S))
+                         | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1PE;
+            TIM12->CCR1  = 0U;
+            TIM12->CCER |= TIM_CCER_CC1P | TIM_CCER_CC1E;
+        } else {
+            TIM12->CCMR1 = (TIM12->CCMR1 & ~(TIM_CCMR1_OC2M | TIM_CCMR1_CC2S))
+                         | TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2PE;
+            TIM12->CCR2  = 0U;
+            TIM12->CCER |= TIM_CCER_CC2P | TIM_CCER_CC2E;
+        }
+        TIM12->ARR = (uint16_t)(IR_FLP_PERIOD_US - 1U);
+        TIM12->EGR = TIM_EGR_UG;
+        TIM12->SR  = 0U;
+    }
     HAL_NVIC_SetPriority(TIM12_IRQn, IR_HSP_TIM12_IRQ_PRIO, 0);
     HAL_NVIC_EnableIRQ(TIM12_IRQn);
     if (flash) hsp_flash_pin(true);
@@ -2184,6 +2288,8 @@ static void hsp_setup(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
     s_fx_inv_on     = false;
     s_hsp_vs_mode   = vs_mode;
     s_hsp_fl_mode   = fl_mode;
+    s_hsp_fl_pwm    = fl_pwm;
+    s_flp_on_us     = s_flp_period_us = s_flp_n = s_flp_last = 0U;
     s_hsp_solid     = solid;
     s_hsp_vs_low_cyc = 0U;
     s_hsp_fl_low_cyc = 0U;
@@ -2247,7 +2353,7 @@ static bool line_pulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
         window = (lines + pre) * line_us + IR_HSP_MARGIN_US;             /* <= budget */
     }
 
-    hsp_setup(ch, milliamps, start_line, lines, count, window, false, solid, flash, inv, false);
+    hsp_setup(ch, milliamps, start_line, lines, count, window, false, solid, flash, inv, false, false);
     return true;
 }
 
@@ -2290,18 +2396,18 @@ bool IR_LED_SetVsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count)
     if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
     window = IR_LED_HighPulseMaxWidth_us(milliamps);
     if (window > 0xFFFFU) window = 0xFFFFU;                              /* 16-bit ARR */
-    hsp_setup(ch, milliamps, 0U, 0U, count, window, true, false, false, false, false);
+    hsp_setup(ch, milliamps, 0U, 0U, count, window, true, false, false, false, false, false);
     return true;
 }
 
-bool IR_LED_SetFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *window_us)
+static bool flash_pulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *window_us, bool pwm)
 {
     if (ch >= IR_CH_COUNT) return false;
     IR_LED_StopHsyncPulse(IR_CH0);
     IR_LED_StopHsyncPulse(IR_CH1);
     if (milliamps == 0U) return true;
 #if IR_PC3_OUTPUT
-    (void)count; (void)window_us;
+    (void)count; (void)window_us; (void)pwm;
     return false;                               /* IMX678: no FLASH input */
 #else
     uint32_t window;
@@ -2312,10 +2418,20 @@ bool IR_LED_SetFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, u
     if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
     window = IR_LED_HighPulseMaxWidth_us(milliamps);
     if (window > 0xFFFFU) window = 0xFFFFU;                              /* 16-bit ARR */
-    hsp_setup(ch, milliamps, 0U, 0U, count, window, false, false, false, false, true);
+    hsp_setup(ch, milliamps, 0U, 0U, count, window, false, false, false, false, true, pwm);
     if (window_us) *window_us = window;
     return true;
 #endif
+}
+
+bool IR_LED_SetFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *window_us)
+{
+    return flash_pulse(ch, milliamps, count, window_us, false);
+}
+
+bool IR_LED_SetFlashPwmPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *budget_us)
+{
+    return flash_pulse(ch, milliamps, count, budget_us, true);
 }
 
 /* Starts the boot FLASH pulse once FLASH is toggling. Waits (retrying each
@@ -2337,6 +2453,11 @@ void IR_LED_StopHsyncPulse(IR_Channel_t ch)
     EXTI->FTSR1 &= ~SN0_VS_Pin;
     s_hsp_state = HSP_OFF;
     s_hsp_fl_mode = false;
+    if (s_hsp_fl_pwm) {                         /* gate is a GPIO again (hsp_end); free the channel */
+        TIM12->CCER  &= ~(TIM_CCER_CC1E | TIM_CCER_CC1P | TIM_CCER_CC2E | TIM_CCER_CC2P);
+        TIM12->CCMR1  = 0U;
+        s_hsp_fl_pwm  = false;
+    }
     if (s_hp_mask == 0U) TIM12->DIER &= ~TIM_DIER_UIE;
     __enable_irq();
     if (s_hsp_flash) {                          /* PC3 back to input */
@@ -2362,6 +2483,10 @@ bool IR_LED_GetHsyncPulse(IR_Channel_t ch, IR_HsyncPulseInfo_t *info)
         info->vs_mode    = s_hsp_vs_mode;
         info->fl_mode    = s_hsp_fl_mode;
         info->fl_low_ns  = (uint32_t)(((uint64_t)s_hsp_fl_low_cyc * 1000U) / cyc_per_us);
+        info->fl_pwm        = s_hsp_fl_pwm;
+        info->pwm_on_us     = s_flp_on_us;
+        info->pwm_period_us = s_flp_period_us;
+        info->pwm_pulses    = s_flp_last;
         info->solid      = s_hsp_solid;
         info->vs_low_ns  = (uint32_t)(((uint64_t)s_hsp_vs_low_cyc * 1000U) / cyc_per_us);
         info->skipped    = s_hsp_skipped;
