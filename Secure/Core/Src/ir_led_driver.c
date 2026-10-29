@@ -198,6 +198,7 @@ static void hp_task(void);                     /* fwd decl */
 static void hsp_timer_cut(void);               /* fwd decl */
 static void hsp_flash_pin(bool out);            /* fwd decl */
 static void hsp_task(void);                    /* fwd decl */
+static void boot_pulse_task(void);             /* fwd decl */
 static bool hsp_active(void);                  /* fwd decl */
 
 static void apply_channel(IR_Channel_t ch)
@@ -700,6 +701,7 @@ void IR_LED_Task(void)
     fs_task();
     hp_task();
     hsp_task();
+    boot_pulse_task();
 
     for (int i = 0; i < IR_CH_COUNT; i++) {
         IR_ChannelState_t *c = &s_ch[i];
@@ -1795,6 +1797,8 @@ static volatile uint32_t s_hsp_cuts   = 0U;
 static volatile uint32_t s_hsp_window_us = 0U;
 static volatile uint32_t s_hsp_high_cyc  = 0U;
 static volatile bool     s_hsp_vs_mode   = false;  /* true: LED on while VSYNC is LOW */
+static volatile bool     s_hsp_fl_mode   = false;  /* true: LED on while FLASH (PC3 in) is LOW */
+static volatile uint32_t s_hsp_fl_low_cyc = 0U;
 static volatile bool     s_hsp_solid     = false;  /* line window: solid ON, ignore HSYNC LOW */
 static volatile uint32_t s_hsp_vs_fall   = 0U;     /* DWT at the last VSYNC fall */
 static volatile uint32_t s_hsp_vs_low_cyc = 0U;
@@ -2090,6 +2094,30 @@ static void hsp_on_vs_fall(void)
     __set_PRIMASK(pm);
 }
 
+/* FLASH (PC3) falling, FLASH pulse mode: exposure starts - current up, LED
+   on, TIM12 cut-off running. */
+IR_HOT static void hsp_on_fl_fall(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    if (s_hsp_state == HSP_WAIT && s_hsp_left != 0U && hsp_begin()) {
+        hsp_led_on();                                        /* LED on */
+        s_hsp_state = HSP_ACTIVE;
+    }
+    __set_PRIMASK(pm);
+}
+
+/* FLASH (PC3) rising, FLASH pulse mode: exposure over - LED off, DAC 0 V,
+   unless the cut-off already ended it. */
+IR_HOT static void hsp_on_fl_rise(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    if (s_hsp_state == HSP_PRE || s_hsp_state == HSP_ACTIVE) hsp_end();
+    s_hsp_fl_low_cyc = IR_CYCCNT - s_fl_last_fall;
+    __set_PRIMASK(pm);
+}
+
 /* SN0_HS falling - only enabled while ACTIVE. */
 IR_HOT static void hsp_on_fall(void)
 {
@@ -2113,7 +2141,7 @@ static void hsp_timer_cut(void)
    programs the cut-off and arms the engine in WAIT. */
 static void hsp_setup(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
                       uint32_t lines, uint32_t count, uint32_t window, bool vs_mode, bool solid,
-                      bool flash, bool inv)
+                      bool flash, bool inv, bool fl_mode)
 {
     uint16_t code;
 
@@ -2155,8 +2183,10 @@ static void hsp_setup(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
     s_hsp_inv       = inv && !vs_mode && !solid;
     s_fx_inv_on     = false;
     s_hsp_vs_mode   = vs_mode;
+    s_hsp_fl_mode   = fl_mode;
     s_hsp_solid     = solid;
     s_hsp_vs_low_cyc = 0U;
+    s_hsp_fl_low_cyc = 0U;
     s_hsp_begun     = false;
     s_hsp_skipped   = 0U;
     s_hsp_ch        = ch;
@@ -2217,7 +2247,7 @@ static bool line_pulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
         window = (lines + pre) * line_us + IR_HSP_MARGIN_US;             /* <= budget */
     }
 
-    hsp_setup(ch, milliamps, start_line, lines, count, window, false, solid, flash, inv);
+    hsp_setup(ch, milliamps, start_line, lines, count, window, false, solid, flash, inv, false);
     return true;
 }
 
@@ -2260,8 +2290,43 @@ bool IR_LED_SetVsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count)
     if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
     window = IR_LED_HighPulseMaxWidth_us(milliamps);
     if (window > 0xFFFFU) window = 0xFFFFU;                              /* 16-bit ARR */
-    hsp_setup(ch, milliamps, 0U, 0U, count, window, true, false, false, false);
+    hsp_setup(ch, milliamps, 0U, 0U, count, window, true, false, false, false, false);
     return true;
+}
+
+bool IR_LED_SetFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *window_us)
+{
+    if (ch >= IR_CH_COUNT) return false;
+    IR_LED_StopHsyncPulse(IR_CH0);
+    IR_LED_StopHsyncPulse(IR_CH1);
+    if (milliamps == 0U) return true;
+#if IR_PC3_OUTPUT
+    (void)count; (void)window_us;
+    return false;                               /* IMX678: no FLASH input */
+#else
+    uint32_t window;
+    if (s_fs_running) return false;             /* ADC owns PC3 (analog) */
+    /* FLASH must be running now: an edge within the last 100 ms. */
+    if (s_fl_falls == 0U || (HAL_GetTick() - s_fl_last_edge_ms) > 100U) return false;
+
+    if (milliamps > IR_LED_PULSE_LIMIT_MA) milliamps = IR_LED_PULSE_LIMIT_MA;
+    window = IR_LED_HighPulseMaxWidth_us(milliamps);
+    if (window > 0xFFFFU) window = 0xFFFFU;                              /* 16-bit ARR */
+    hsp_setup(ch, milliamps, 0U, 0U, count, window, false, false, false, false, true);
+    if (window_us) *window_us = window;
+    return true;
+#endif
+}
+
+/* Starts the boot FLASH pulse once FLASH is toggling. Waits (retrying each
+   pass) until the sensor streams; done for good after the first start or
+   any other hsync-engine mode taking over. */
+static void boot_pulse_task(void)
+{
+    static bool done = (IR_BOOT_FLASH_PULSE_MA == 0U);
+    if (done || HAL_GetTick() < IR_BOOT_FLASH_PULSE_DELAY_MS) return;
+    if (s_hsp_state != HSP_OFF) { done = true; return; }   /* user already chose a mode */
+    if (IR_LED_SetFlashPulse(IR_CH0, IR_BOOT_FLASH_PULSE_MA, 0U, NULL)) done = true;
 }
 
 void IR_LED_StopHsyncPulse(IR_Channel_t ch)
@@ -2271,6 +2336,7 @@ void IR_LED_StopHsyncPulse(IR_Channel_t ch)
     hsp_end();
     EXTI->FTSR1 &= ~SN0_VS_Pin;
     s_hsp_state = HSP_OFF;
+    s_hsp_fl_mode = false;
     if (s_hp_mask == 0U) TIM12->DIER &= ~TIM_DIER_UIE;
     __enable_irq();
     if (s_hsp_flash) {                          /* PC3 back to input */
@@ -2294,6 +2360,8 @@ bool IR_LED_GetHsyncPulse(IR_Channel_t ch, IR_HsyncPulseInfo_t *info)
         info->timer_cuts = s_hsp_cuts;
         info->hs_high_ns = (uint32_t)(((uint64_t)s_hsp_high_cyc * 1000U) / cyc_per_us);
         info->vs_mode    = s_hsp_vs_mode;
+        info->fl_mode    = s_hsp_fl_mode;
+        info->fl_low_ns  = (uint32_t)(((uint64_t)s_hsp_fl_low_cyc * 1000U) / cyc_per_us);
         info->solid      = s_hsp_solid;
         info->vs_low_ns  = (uint32_t)(((uint64_t)s_hsp_vs_low_cyc * 1000U) / cyc_per_us);
         info->skipped    = s_hsp_skipped;
@@ -2326,6 +2394,7 @@ IR_HOT void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
         return;
     }
     if (GPIO_Pin != FLASH_Pin) return;
+    if (s_hsp_fl_mode) hsp_on_fl_fall();     /* FLASH pulse: current up, LED on, cut-off running */
     if (s_dac_gate & 1U) DAC1->DHR12R1 = s_ch[IR_CH0].raw_code;   /* strobe: current up */
     if (s_dac_gate & 2U) DAC1->DHR12R2 = s_ch[IR_CH1].raw_code;
     if (s_gate_pins != 0U) {                 /* exposure starts */
@@ -2347,7 +2416,7 @@ IR_HOT void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
         s_hs_period_cyc = now - s_hs_last;
         s_hs_last = now;
         s_hs_count++;
-        if (s_hsp_state != HSP_OFF) hsp_on_rise(s_hs_count - s_hs_at_vs);
+        if (s_hsp_state != HSP_OFF && !s_hsp_fl_mode) hsp_on_rise(s_hs_count - s_hs_at_vs);
         return;
     }
     if (GPIO_Pin == SN0_VS_Pin) {
@@ -2360,10 +2429,11 @@ IR_HOT void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
         s_hs_at_vs = s_hs_count;
         s_vs_count++;
         s_vs_last_ms = HAL_GetTick();
-        if (s_hsp_state != HSP_OFF) hsp_on_vsync();
+        if (s_hsp_state != HSP_OFF && !s_hsp_fl_mode) hsp_on_vsync();   /* FLASH mode: VSYNC plays no part */
         return;
     }
     if (GPIO_Pin != FLASH_Pin) return;
+    if (s_hsp_fl_mode) hsp_on_fl_rise();
     if (s_gate_pins != 0U) {                 /* exposure ends */
         uint32_t inv = s_gate_inv_pins, norm = s_gate_pins & ~inv;
         PWM_DIM0_GPIO_Port->BSRR = norm | (inv << 16U);   /* normal HIGH, inverted LOW */

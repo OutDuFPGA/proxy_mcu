@@ -22,6 +22,10 @@ static void print_help(IR_LED_CLI_PrintFn p)
     p("  ir [ch0|ch1] ma <mA>    - Set LED current via DAC_DIMx (default ch0)\r\n");
     p("  ir [ch0|ch1] mv <mV>    - Set DAC_DIMx voltage directly\r\n");
     p("  ir [ch0|ch1] strobe on|off - LED on while FLASH low, DAC 0 V while FLASH high\r\n");
+    p("  ir [ch0|ch1] flash <mA> [n] - IMX568 LED pulse: on at <mA> (<=20 A) while FLASH is low\r\n");
+    p("                            (exposure), cut off at the USHIO derating width (ir hpulse table);\r\n");
+    p("                            n pulses (0 = continuous)\r\n");
+    p("  ir [ch0|ch1] flash on|off - repeat last flash settings (default 1000) / stop\r\n");
     p("  ir [ch0|ch1] ramp <mA> <ms>  - Change current gradually to <mA> over <ms> (non-blocking)\r\n");
     p("  ir [ch0|ch1] dacpwm <hz> <duty%>|off - Chop DAC_DIMx between 0 V and the setpoint\r\n");
     p("  ir [ch0|ch1] dactest <0..1500 mV>|off - DAC test, BYPASSES the 4 A cap (unplug J5/J6!)\r\n");
@@ -180,7 +184,18 @@ static void print_status(IR_LED_CLI_PrintFn p)
             p(l);
         }
         IR_HsyncPulseInfo_t hs;
-        if (IR_LED_GetHsyncPulse(ch, &hs) && hs.vs_mode) {
+        if (IR_LED_GetHsyncPulse(ch, &hs) && hs.fl_mode) {
+            char cnt[24];
+            if (hs.left) snprintf(cnt, sizeof(cnt), "%lu left", (unsigned long)hs.left);
+            else         snprintf(cnt, sizeof(cnt), "continuous");
+            snprintf(l, sizeof(l), "  FLASH PULSE: %lu mA while FLASH LOW, cut-off %lu us, %s\r\n",
+                     (unsigned long)hs.ma, (unsigned long)hs.window_us, cnt);
+            p(l);
+            snprintf(l, sizeof(l), "               fired %lu, timer cut-offs %lu, skipped %lu, FLASH LOW %lu ns\r\n",
+                     (unsigned long)hs.fired, (unsigned long)hs.timer_cuts, (unsigned long)hs.skipped,
+                     (unsigned long)hs.fl_low_ns);
+            p(l);
+        } else if (IR_LED_GetHsyncPulse(ch, &hs) && hs.vs_mode) {
             char cnt[24];
             if (hs.left) snprintf(cnt, sizeof(cnt), "%lu left", (unsigned long)hs.left);
             else         snprintf(cnt, sizeof(cnt), "continuous");
@@ -515,11 +530,62 @@ bool IR_LED_CLI_ProcessCommand(const char *cmd, IR_LED_CLI_PrintFn print_fn)
     }
 
 #if IR_PC3_OUTPUT
-    if (strcmp(rest, "strobe on") == 0 || strcmp(rest, "gate on") == 0 || strcmp(rest, "gate inv") == 0) {
+    if (strcmp(rest, "strobe on") == 0 || strcmp(rest, "gate on") == 0 || strcmp(rest, "gate inv") == 0 ||
+        (strncmp(rest, "flash ", 6) == 0 && strcmp(rest, "flash off") != 0)) {
         print_fn("ERROR: IMX678 build - PC3 (FLASH) is an MCU output, there is no FLASH input to gate/strobe on\r\n");
         return true;
     }
 #endif
+    /* IMX568 (global shutter, no XVS/XHS out): LED pulse = FLASH low, on the
+       hsync/vsync pulse engine so TIM12 cuts each pulse at the USHIO derating
+       width for the current. */
+    static char fl_last[24] = "100";            /* = IR_BOOT_FLASH_PULSE_MA */
+    if (strcmp(rest, "flash on") == 0) {
+        char re[48];
+        snprintf(re, sizeof(re), "ir ch%d flash %s", n, fl_last);
+        snprintf(line, sizeof(line), "NOTE: '%s'\r\n", re);
+        print_fn(line);
+        return IR_LED_CLI_ProcessCommand(re, print_fn);
+    }
+    if (strcmp(rest, "flash off") == 0) {
+        IR_LED_StopHsyncPulse(ch);
+        snprintf(line, sizeof(line), "SUCCESS: ch%d FLASH pulse off (DAC_DIM%d 0 V, PWM_DIM%d HIGH)\r\n", n, n, n);
+        print_fn(line);
+        return true;
+    }
+    if (strncmp(rest, "flash ", 6) == 0) {
+        const char *a = rest + 6;
+        char *end;
+        long ma = strtol(a, &end, 10);
+        long cnt = 0;
+        if (*end == ' ') cnt = strtol(end + 1, &end, 10);
+        if (end == a || *end != '\0' || ma <= 0 || cnt < 0) {
+            print_fn("ERROR: usage 'ir [ch0|ch1] flash <mA> [n]' or 'flash on|off'\r\n"); return true;
+        }
+        if ((uint32_t)ma > IR_LED_PULSE_LIMIT_MA) {
+            snprintf(line, sizeof(line), "NOTE: clamped to the pulse limit of %lu mA\r\n", (unsigned long)IR_LED_PULSE_LIMIT_MA);
+            print_fn(line);
+            ma = (long)IR_LED_PULSE_LIMIT_MA;
+        }
+        uint32_t cut;
+        if (!IR_LED_SetFlashPulse(ch, (uint32_t)ma, (uint32_t)cnt, &cut)) {
+            print_fn("ERROR: FLASH (PC3) not toggling, or FLASH ADC sync running\r\n"); return true;
+        }
+        snprintf(fl_last, sizeof(fl_last), "%ld %ld", ma, cnt);
+        IR_HsyncPulseInfo_t hs;
+        IR_FlashInput_t fi;
+        (void)IR_LED_GetHsyncPulse(ch, &hs);
+        IR_LED_GetFlashInput(&fi);
+        snprintf(line, sizeof(line), "SUCCESS: ch%d FLASH pulse %lu mA while FLASH low, cut-off %lu us, %s\r\n", n,
+                 (unsigned long)hs.ma, (unsigned long)cut, cnt ? "counted" : "continuous");
+        print_fn(line);
+        if (fi.toggling && fi.low_us > cut) {
+            snprintf(line, sizeof(line), "NOTE: FLASH low is %lu us - the cut-off ends each pulse early (derating at %ld mA)\r\n",
+                     (unsigned long)fi.low_us, ma);
+            print_fn(line);
+        }
+        return true;
+    }
     if (strcmp(rest, "strobe on") == 0 || strcmp(rest, "strobe off") == 0) {
         bool on = (rest[8] == 'n');
         if (!IR_LED_SetStrobe(ch, on)) {

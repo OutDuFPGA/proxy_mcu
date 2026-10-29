@@ -277,7 +277,12 @@ extern "C" {
    FLASH is high. The MCU sets the current through DAC_DIM0 (CTRL1).
    Only CH0 has an LED driver fitted; CH1's DAC is left at 0.
    IR_LED_Init() sets CH0 to IR_BOOT_CURRENT_MA. */
-#define IR_BOOT_CURRENT_MA              1000U
+#define IR_BOOT_CURRENT_MA              100U
+/* IMX568: IR_LED_Task() starts the FLASH pulse (IR_LED_SetFlashPulse) on CH0
+   at this current IR_BOOT_FLASH_PULSE_DELAY_MS after boot, once FLASH is
+   toggling - one attempt per boot, so a later 'flash off' sticks. 0 = off. */
+#define IR_BOOT_FLASH_PULSE_MA          (IR_PC3_OUTPUT ? 0U : 100U)
+#define IR_BOOT_FLASH_PULSE_DELAY_MS    2000U
 
 /* FLASH sync (IR_MODE_FLASH_SYNC) is BLOCKED while this is 0: SetMode
    refuses it and ADC1 is never started, so PC3 is never touched beyond its
@@ -580,6 +585,8 @@ typedef struct {
     uint32_t skipped;       /* starts refused by the IR_HP_MIN_SPACING_US guard */
     bool     flash;         /* set up by IR_LED_SetHsyncFlashPulse() */
     bool     inv;           /* ... with inv: PC3 = NOT HSYNC */
+    bool     fl_mode;       /* set up by IR_LED_SetFlashPulse() */
+    uint32_t fl_low_ns;     /* flash mode: last measured FLASH LOW time */
 } IR_HsyncPulseInfo_t;
 
 bool IR_LED_SetHsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start_line,
@@ -607,6 +614,16 @@ bool IR_LED_SetHsyncLowPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t start
    pulses, 0 = continuous. Stopped / reported with the hsync functions
    (info.vs_mode set). Returns false for a bad channel or no VSYNC. */
 bool IR_LED_SetVsyncPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count);
+/* FLASH PULSE (IMX568, global shutter - no XVS/XHS): same engine, LED on at
+   milliamps (<= IR_LED_PULSE_LIMIT_MA) while FLASH (PC3 input) is LOW, i.e.
+   the exposure - DAC up and PWM_DIMx low on the fall, both off on the rise.
+   TIM12 cuts it at IR_LED_HighPulseMaxWidth_us(milliamps) (16-bit, so at
+   most 65535 us) if FLASH stays low longer; *window_us gets that cut-off.
+   Starts closer than IR_HP_MIN_SPACING_US are skipped. count = pulses, 0 =
+   continuous. Stopped / reported with the hsync functions (info.fl_mode
+   set). False for a bad channel, no FLASH edges, FLASH ADC sync running or
+   the IMX678 build. */
+bool IR_LED_SetFlashPulse(IR_Channel_t ch, uint32_t milliamps, uint32_t count, uint32_t *window_us);
 /* VSYNC LINE PULSE: as IR_LED_SetHsyncPulse() (same line count from VSYNC,
    pre-line DAC step, derating clamp on lines, TIM12 cut-off) but the LED is
    held solid ON from line start_line to start_line + lines - 1 instead of

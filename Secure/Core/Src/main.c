@@ -178,6 +178,7 @@ static void CLI_DisplayMenu(void) {
   CLI_Print("  ir status             - FLASH/VSYNC inputs, both channels, IR-cut\r\n");
   CLI_Print("  ir [chN] ma <mA>      - LED current 0..4000 mA (mv <mV>: DAC volts)\r\n");
   CLI_Print("  ir [chN] strobe on|off  - lit while FLASH low, DAC 0 V while high\r\n");
+  CLI_Print("  ir [chN] flash <mA> [n]|on|off - IMX568 LED pulse on FLASH low, derating cut-off\r\n");
   CLI_Print("  ir [chN] gate on|off|inv - PWM_DIM follows FLASH (inv: opposite)\r\n");
   CLI_Print("  ir [chN] pwm high|low|<hz> <duty%> - PWM_DIM fixed or PWM\r\n");
   CLI_Print("  ir [chN] ramp <mA> <ms>   - change current gradually\r\n");
