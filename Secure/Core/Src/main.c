@@ -81,7 +81,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-#define CMD_BUFFER_SIZE 64
+#define CMD_BUFFER_SIZE 128
 static uint8_t rx_byte;
 static char cmd_buffer[CMD_BUFFER_SIZE];
 static uint16_t cmd_index = 0;

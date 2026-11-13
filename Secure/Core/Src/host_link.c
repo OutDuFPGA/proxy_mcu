@@ -7,8 +7,8 @@
 #include "lens_ctrl.h"
 #include <string.h>
 
-#define HL_LINE_MAX  48
-#define HL_TX_SIZE   512
+#define HL_LINE_MAX  96
+#define HL_TX_SIZE   4096
 
 static uint8_t  s_rx_byte;
 static char     s_line[HL_LINE_MAX];
@@ -68,6 +68,12 @@ void HostLink_Error(UART_HandleTypeDef *huart)
 void HostLink_Task(void)
 {
   if (s_ready_flag) {
+    /* "#<console lens command>" = debug pass-through, e.g. "#lens scan",
+       "#zoom_run 1 1600" - reply text comes back on this link. */
+    if (s_ready[0] == '#') {
+      if (!LENS_CLI(s_ready + 1, HostLink_Print)) HostLink_Print("ERR CLI\n");
+      HostLink_Print("#END\n");
+    } else
     LENS_HostCommand(s_ready, HostLink_Print);
     s_ready_flag = 0;
   }

@@ -321,6 +321,6 @@ void EXTI9_IRQHandler(void)
 /* USER CODE END 1 */
 
 /* Lens STEP timers: one update interrupt per completed STEP pulse. */
-void TIM3_IRQHandler(void)    { LENS_TimerIRQ(LENS_ZOOM);  }
-void TIM8_UP_IRQHandler(void) { LENS_TimerIRQ(LENS_FOCUS); }
+void TIM3_IRQHandler(void)    { LENS_TimerIRQ(LENS_AXIS_U1); }   /* driver U1 */
+void TIM8_UP_IRQHandler(void) { LENS_TimerIRQ(LENS_AXIS_U2); }   /* driver U2 */
 void TIM4_IRQHandler(void)    { LENS_TimerIRQ(LENS_IRIS);  }

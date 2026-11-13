@@ -33,6 +33,16 @@
 
 typedef enum { LENS_ZOOM = 0, LENS_FOCUS = 1, LENS_IRIS = 2, LENS_NAXIS = 3 } LensAxis_t;
 
+/* Which TMC2300 drives which lens motor. On the board + lens cable in use
+   (2026-11-13) the motors come out crossed: driver U1 (schematic "ZOOM",
+   TIM3/PB5, UART addr 0) turns the FOCUS motor and U2 (schematic "FOCUS",
+   TIM8/PC7, addr 1) turns the ZOOM motor. 1 = crossed, 0 = as schematic. */
+#ifndef LENS_SWAP_ZOOM_FOCUS
+#define LENS_SWAP_ZOOM_FOCUS  1
+#endif
+#define LENS_AXIS_U1  (LENS_SWAP_ZOOM_FOCUS ? LENS_FOCUS : LENS_ZOOM)   /* TIM3 */
+#define LENS_AXIS_U2  (LENS_SWAP_ZOOM_FOCUS ? LENS_ZOOM : LENS_FOCUS)   /* TIM8 */
+
 typedef void (*LensPrintFn)(const char *str);
 
 void LENS_Init(LensPrintFn print);          /* drivers + timers; prints a boot report */

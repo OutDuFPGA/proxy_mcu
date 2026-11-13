@@ -47,7 +47,7 @@ _Min_Stack_Size = 0x2000; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x30000000,   LENGTH = 320K
-  FLASH    (rx)    : ORIGIN = 0x0C000000,   LENGTH = 504K
+  FLASH    (rx)    : ORIGIN = 0x0C000000,   LENGTH = 496K   /* sector 62 (0x0C07C000) = lens calibration, see lens_ctrl.c */
   FLASH_NSC    (rx)    : ORIGIN = 0x0C07E000,   LENGTH = 8K
 }
 
