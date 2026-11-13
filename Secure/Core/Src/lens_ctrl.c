@@ -114,9 +114,9 @@
    as the zoom home. Used whenever no valid calibration is saved in flash.
    Units are firmware microsteps (16/fs); zoom driver U2 currently runs at its
    reset 32 ustep because its UART is not answering - re-measure once fixed. */
-#define ZOOM_CAL_TRAVEL      11656    /* forward limit, usteps from zero          */
+#define ZOOM_CAL_TRAVEL      16900    /* forward limit: 100 short of the far stop (~17000) */
 #define ZOOM_CAL_HOME_PPS      300u
-#define ZOOM_CAL_HOME_MAX_FS   813u   /* full search (position unknown)           */
+#define ZOOM_CAL_HOME_MAX_FS  1130u   /* full search: travel + 1/16 + backoff     */
 #define ZOOM_CAL_BACKOFF_FS      8u   /* zero = 8 fs off the reverse stop         */
 #define ZOOM_CAL_HOME_EXTRA   1232    /* re-home search past zero, usteps         */
 
@@ -1188,7 +1188,7 @@ void LENS_Init(LensPrintFn print)
 
   print("\r\n[LENS] NV-0622IR lens - guarded motion control (lens help)\r\n");
   print(cfg_ok ? "[LENS] calibration loaded from flash\r\n"
-               : "[LENS] no saved calibration - built-in zoom calibration (0..11656), focus uncalibrated\r\n");
+               : "[LENS] no saved calibration - built-in zoom calibration (0..16900), focus uncalibrated\r\n");
   scan_report(print);
   config_report(print);
   if (s_autohome) {
