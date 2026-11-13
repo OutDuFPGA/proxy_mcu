@@ -26,7 +26,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "TMC2300.h"
+#include "lens_ctrl.h"
+#include "host_link.h"
 #include "ir_led_driver.h"
 #include "ir_led_cli.h"
 #include <string.h>
@@ -97,7 +98,7 @@ static volatile uint8_t cmd_ready_flag = 0;
    Routing every byte through one buffer that only the main loop drains
    removes the contention: producers never block and never touch the
    peripheral, and there is exactly one writer to TDR. */
-#define CLI_TX_BUF_SIZE 2048
+#define CLI_TX_BUF_SIZE 4096   /* boot: lens report + menu ~2.5 KB */
 static volatile uint8_t  cli_tx_buf[CLI_TX_BUF_SIZE];
 static volatile uint16_t cli_tx_head = 0;   /* producers advance this */
 static volatile uint16_t cli_tx_tail = 0;   /* drain advances this    */
@@ -143,15 +144,15 @@ static void CLI_Print(const char *str) {
 
 /* Main loop only, so the tail has a single owner and needs no guarding.
    Writes TDR directly rather than going through the HAL, which keeps this
-   independent of huart4.gState - the whole point of the exercise. Returns
+   independent of CONSOLE_UART.gState - the whole point of the exercise. Returns
    as soon as the FIFO is full so the loop keeps turning. */
 static void CLI_TxDrain(void)
 {
   while (cli_tx_tail != cli_tx_head) {
-    if ((huart4.Instance->ISR & USART_ISR_TXE_TXFNF) == 0u) {
+    if ((CONSOLE_UART.Instance->ISR & USART_ISR_TXE_TXFNF) == 0u) {
       return;
     }
-    huart4.Instance->TDR = cli_tx_buf[cli_tx_tail];
+    CONSOLE_UART.Instance->TDR = cli_tx_buf[cli_tx_tail];
     cli_tx_tail = (uint16_t)((cli_tx_tail + 1u) % CLI_TX_BUF_SIZE);
   }
 }
@@ -167,13 +168,11 @@ static void CLI_DisplayMenu(void) {
   CLI_Print("=================================\r\n");
   CLI_Print("  help                  - Display this menu\r\n");
   CLI_Print("  <color>_on / _off     - e.g. red_on, green_off\r\n");
-  CLI_Print("  zoom_run <dir> <hz>   - Spin Zoom continuously\r\n");
-  CLI_Print("  zoom_stop             - Stop Zoom\r\n");
-  CLI_Print("  focus_run <dir> <hz>  - Spin Focus continuously\r\n");
-  CLI_Print("  focus_stop            - Stop Focus\r\n");
-  CLI_Print("  iris_run <dir> <hz>   - Spin Iris continuously\r\n");
-  CLI_Print("  iris_stop             - Stop Iris\r\n");
-  CLI_Print("  focus_dump            - Dump Focus Registers\r\n");
+  CLI_Print("  --- Lens (J11): zoom / focus steppers, pos in microsteps ---\r\n");
+  CLI_Print("  lens [status]         - positions, motion state, driver config\r\n");
+  CLI_Print("  lens <z|f> goto <pos> / rel <d> / jog <1|0> [pps] / stop\r\n");
+  CLI_Print("  lens help             - full lens command list (tuning, limits, regs)\r\n");
+  CLI_Print("  zoom_run|focus_run <dir> <step_hz>, *_stop  - legacy jog\r\n");
   CLI_Print("  --- IR LED: ch0 = J5, ch1 = J6 (prefix optional, default ch0) ---\r\n");
   CLI_Print("  ir status             - FLASH/VSYNC inputs, both channels, IR-cut\r\n");
   CLI_Print("  ir [chN] ma <mA>      - LED current 0..4000 mA (mv <mV>: DAC volts)\r\n");
@@ -190,7 +189,6 @@ static void CLI_DisplayMenu(void) {
 
 static void CLI_Process_Command(char *cmd) {
   cmd[strcspn(cmd, "\r\n")] = 0;
-  char resp_buf[64];
 
   if (strlen(cmd) == 0) { CLI_Print("MCU> "); return; }
 
@@ -202,41 +200,6 @@ static void CLI_Process_Command(char *cmd) {
   else if (strcmp(cmd, "red_on") == 0)    { HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET); CLI_Print("SUCCESS: Red ON\r\nMCU> "); }
   else if (strcmp(cmd, "red_off") == 0)   { HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET); CLI_Print("SUCCESS: Red OFF\r\nMCU> "); }
 
-  /* ZOOM */
-  else if (strncmp(cmd, "zoom_run ", 9) == 0) {
-    char *p = cmd + 9;
-    long dir = strtol(p, &p, 10);
-    long hz = strtol(p, NULL, 10);
-    TMC2300_Run(MOTOR_ZOOM, (uint8_t)dir, (uint32_t)hz);
-    snprintf(resp_buf, sizeof(resp_buf), "SUCCESS: Zoom spinning %ld Hz\r\nMCU> ", hz);
-    CLI_Print(resp_buf);
-  }
-  else if (strcmp(cmd, "zoom_stop") == 0) { TMC2300_Stop(MOTOR_ZOOM); CLI_Print("SUCCESS: Zoom stopped\r\nMCU> "); }
-
-  /* FOCUS */
-  else if (strncmp(cmd, "focus_run ", 10) == 0) {
-    char *p = cmd + 10;
-    long dir = strtol(p, &p, 10);
-    long hz = strtol(p, NULL, 10);
-    TMC2300_Run(MOTOR_FOCUS, (uint8_t)dir, (uint32_t)hz);
-    snprintf(resp_buf, sizeof(resp_buf), "SUCCESS: Focus spinning %ld Hz\r\nMCU> ", hz);
-    CLI_Print(resp_buf);
-  }
-  else if (strcmp(cmd, "focus_stop") == 0) { TMC2300_Stop(MOTOR_FOCUS); CLI_Print("SUCCESS: Focus stopped\r\nMCU> "); }
-
-  /* IRIS */
-  else if (strncmp(cmd, "iris_run ", 9) == 0) {
-    char *p = cmd + 9;
-    long dir = strtol(p, &p, 10);
-    long hz = strtol(p, NULL, 10);
-    TMC2300_Run(MOTOR_IRIS, (uint8_t)dir, (uint32_t)hz);
-    snprintf(resp_buf, sizeof(resp_buf), "SUCCESS: Iris spinning %ld Hz\r\nMCU> ", hz);
-    CLI_Print(resp_buf);
-  }
-  else if (strcmp(cmd, "iris_stop") == 0) { TMC2300_Stop(MOTOR_IRIS); CLI_Print("SUCCESS: Iris stopped\r\nMCU> "); }
-
-  /* DIAGNOSTICS */
-  else if (strcmp(cmd, "focus_dump") == 0) { TMC2300_DumpRegisters(); CLI_Print("MCU> "); }
 
   /* IR LED driver console (enable/disable, per-channel mode, current, window,
      fault clear, status) — see ir_led_cli.c for the full command set ("ir help").
@@ -247,7 +210,21 @@ static void CLI_Process_Command(char *cmd) {
     CLI_Print("MCU> ");
   }
 
+  /* Lens zoom/focus steppers: "lens ..." plus the legacy zoom_run/... names */
+  else if (LENS_CLI(cmd, CLI_Print)) { CLI_Print("MCU> "); }
+
   else { CLI_Print("ERROR: Unknown Command.\r\nMCU> "); }
+}
+/* A lens axis stopped: tell the SoC (async DONE line) and the console. */
+static void Lens_Event(LensAxis_t ax, int32_t pos, const char *reason)
+{
+  char b[64];
+  if (ax == LENS_ZOOM || ax == LENS_FOCUS) {
+    snprintf(b, sizeof b, "DONE %c %ld %s\n", ax == LENS_ZOOM ? 'Z' : 'F', (long)pos, reason);
+    HostLink_Print(b);
+  }
+  snprintf(b, sizeof b, "\r\n[LENS] %s %s at %ld\r\nMCU> ", LENS_AxisName[ax], reason, (long)pos);
+  CLI_Print(b);
 }
 /* USER CODE END 0 */
 
@@ -285,7 +262,8 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_UART4_Init();
+  MX_UART4_Init();          /* J12: SOC board link, no console */
+  MX_USART11_UART_Init();   /* J10: MCU> console (host USB) */
   MX_USART2_UART_Init();
   MX_ICACHE_Init();
   MX_TIM3_Init();
@@ -298,8 +276,8 @@ int main(void)
     HAL_NVIC_DisableIRQ(USART1_IRQn);
 
     /* 2. Flush startup hardware noise */
-    __HAL_UART_CLEAR_FLAG(&huart4, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
-    volatile uint32_t tmpreg = huart4.Instance->RDR;
+    __HAL_UART_CLEAR_FLAG(&CONSOLE_UART, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
+    volatile uint32_t tmpreg = CONSOLE_UART.Instance->RDR;
     (void)tmpreg;
 
     /* 3. Reset state */
@@ -307,8 +285,10 @@ int main(void)
     cmd_ready_flag = 0;
     memset(cmd_buffer, 0, CMD_BUFFER_SIZE);
 
-    /* 4. Initialize Motor Drivers */
-    TMC2300_Init();
+    /* 4. Lens zoom/focus drivers (TMC2300 x3) + M5S SoC link on UART4/J12 */
+    LENS_SetEventHandler(Lens_Event);
+    LENS_Init(CLI_Print);
+    HostLink_Init();
 
     /* 5. Initialize IR LED driver (LT3763 boards on J5/J6).
        Deliberately comes up DARK: master enable off, both channels
@@ -328,9 +308,9 @@ int main(void)
                                            (only used in IR_MODE_FRAME_STROBE) */
     IR_LED_SetWindow(IR_CH1, 0, 2160);
 
-    /* 6. Display UI and start listening on UART4 */
+    /* 6. Display UI and start listening on the console (USART11, J10) */
     CLI_DisplayMenu();
-    HAL_UART_Receive_IT(&huart4, &rx_byte, 1);
+    HAL_UART_Receive_IT(&CONSOLE_UART, &rx_byte, 1);
   /* USER CODE END 2 */
 
 #ifdef USE_NONSECURE_APP
@@ -356,7 +336,10 @@ int main(void)
     /* Stall detection for the three TMC2300 axes. Polled here rather than from
        the DIAG pins' EXTI lines because a stall only has to stop the step
        train "soon", and this keeps the sensor-sync EXTI budget free. */
-    TMC2300_StallGuard_Poll();
+    LENS_Task();
+
+    /* M5S SoC commands on UART4 / J12 */
+    HostLink_Task();
 
     /* Confirms LT3763 faults with blanking. Must be polled: the FAULT line is
        legitimately asserted whenever a channel is dark, so an edge alone
@@ -456,7 +439,8 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == UART4)
+  HostLink_RxCplt(huart);
+  if (huart->Instance == CONSOLE_UART_INSTANCE)
   {
     /* Swallows the second half of a CRLF pair. Terminals disagree about what
        Enter sends - CR, LF, or both - and without this a CRLF terminal gets
@@ -470,7 +454,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
        and the old order left RX deaf for the whole duration of a blocking
        echo. rx_byte is copied above because this call re-points the HAL at
        it immediately. */
-    HAL_UART_Receive_IT(&huart4, &rx_byte, 1);
+    HAL_UART_Receive_IT(&CONSOLE_UART, &rx_byte, 1);
 
     /* Nothing is echoed up front any more. Each case below emits exactly the
        bytes that match what it did to cmd_buffer, so the screen can never
@@ -527,9 +511,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == UART4) {
+  HostLink_Error(huart);
+  if (huart->Instance == CONSOLE_UART_INSTANCE) {
     __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
-    HAL_UART_Receive_IT(&huart4, &rx_byte, 1);
+    HAL_UART_Receive_IT(&CONSOLE_UART, &rx_byte, 1);
   }
 }
 /* USER CODE END 4 */

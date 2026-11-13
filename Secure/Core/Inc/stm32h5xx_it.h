@@ -58,6 +58,10 @@ void PendSV_Handler(void);
 void SysTick_Handler(void);
 void USART1_IRQHandler(void);
 void UART4_IRQHandler(void);
+void USART11_IRQHandler(void);
+void TIM3_IRQHandler(void);
+void TIM8_UP_IRQHandler(void);
+void TIM4_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 void EXTI0_IRQHandler(void);   /* IR_FAULT1 (PE0) */
 void EXTI1_IRQHandler(void);   /* SN0_HS - sensor HSYNC (PB1) */

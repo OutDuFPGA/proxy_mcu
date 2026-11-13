@@ -32,7 +32,7 @@ CSRC := \
   $(CORE)/ir_led_driver.c $(CORE)/dac.c $(CORE)/main.c $(CORE)/secure_nsc.c \
   $(CORE)/stm32h5xx_hal_msp.c $(CORE)/stm32h5xx_it.c $(CORE)/tim.c \
   $(CORE)/usart.c $(CORE)/system_stm32h5xx_s.c \
-  $(APP)/TMC2300.c $(APP)/syscalls.c $(APP)/sysmem.c \
+  $(CORE)/lens_ctrl.c $(CORE)/host_link.c $(APP)/syscalls.c $(APP)/sysmem.c \
   $(HAL)/stm32h5xx_hal.c $(HAL)/stm32h5xx_hal_cortex.c $(HAL)/stm32h5xx_hal_dma.c \
   $(HAL)/stm32h5xx_hal_dma_ex.c $(HAL)/stm32h5xx_hal_exti.c $(HAL)/stm32h5xx_hal_flash.c \
   $(HAL)/stm32h5xx_hal_flash_ex.c $(HAL)/stm32h5xx_hal_gpio.c $(HAL)/stm32h5xx_hal_gtzc.c \

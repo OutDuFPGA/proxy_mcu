@@ -57,6 +57,8 @@
 
 /* External variables --------------------------------------------------------*/
 extern UART_HandleTypeDef huart4;
+extern UART_HandleTypeDef huart11;
+#include "lens_ctrl.h"
 extern UART_HandleTypeDef huart1;
 /* USER CODE BEGIN EV */
 
@@ -243,6 +245,14 @@ void UART4_IRQHandler(void)
   /* USER CODE END UART4_IRQn 1 */
 }
 
+/**
+  * @brief This function handles USART11 global interrupt (MCU> console, J10).
+  */
+void USART11_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart11);
+}
+
 /* USER CODE BEGIN 1 */
 
 /**
@@ -309,3 +319,8 @@ void EXTI9_IRQHandler(void)
 }
 
 /* USER CODE END 1 */
+
+/* Lens STEP timers: one update interrupt per completed STEP pulse. */
+void TIM3_IRQHandler(void)    { LENS_TimerIRQ(LENS_ZOOM);  }
+void TIM8_UP_IRQHandler(void) { LENS_TimerIRQ(LENS_FOCUS); }
+void TIM4_IRQHandler(void)    { LENS_TimerIRQ(LENS_IRIS);  }

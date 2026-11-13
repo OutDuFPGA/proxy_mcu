@@ -25,6 +25,7 @@
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart4;
+UART_HandleTypeDef huart11;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
@@ -70,6 +71,37 @@ void MX_UART4_Init(void)
 
   /* USER CODE END UART4_Init 2 */
 
+}
+/* USART11 init function - MCU> console on J10 (PA6 TX / PA7 RX) */
+void MX_USART11_UART_Init(void)
+{
+  huart11.Instance = USART11;
+  huart11.Init.BaudRate = 115200;
+  huart11.Init.WordLength = UART_WORDLENGTH_8B;
+  huart11.Init.StopBits = UART_STOPBITS_1;
+  huart11.Init.Parity = UART_PARITY_NONE;
+  huart11.Init.Mode = UART_MODE_TX_RX;
+  huart11.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart11.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart11.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart11.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart11.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart11) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart11, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart11, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart11) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 /* USART1 init function */
 
@@ -201,6 +233,32 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
   /* USER CODE BEGIN UART4_MspInit 1 */
 
   /* USER CODE END UART4_MspInit 1 */
+  }
+  else if(uartHandle->Instance==USART11)
+  {
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USART11;
+    PeriphClkInitStruct.Usart11ClockSelection = RCC_USART11CLKSOURCE_PCLK1;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    __HAL_RCC_USART11_CLK_ENABLE();
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /**USART11 GPIO Configuration (also muxed in gpio.c)
+    PA6     ------> USART11_TX
+    PA7     ------> USART11_RX
+    */
+    GPIO_InitStruct.Pin = UART1_TXD_3V3_Pin|UART1_RXD_3V3_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART11;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* Console RX at top priority, as UART4 had (see ir_led_driver.c) */
+    HAL_NVIC_SetPriority(USART11_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(USART11_IRQn);
   }
   else if(uartHandle->Instance==USART1)
   {
