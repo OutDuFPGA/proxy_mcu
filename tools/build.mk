@@ -53,7 +53,7 @@ STAMP  := $(OUT)/sensor-$(SENSOR).stamp
 CPU   := -mcpu=cortex-m33 -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb
 CFLAGS := $(CPU) -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32H563xx $(INC) \
           -O0 -ffunction-sections -fdata-sections -Wall -mcmse --specs=nano.specs \
-          -DIR_SENSOR=IR_SENSOR_$(SENSOR)
+          -DIR_SENSOR=IR_SENSOR_$(SENSOR) -MMD -MP
 LDFLAGS := $(CPU) -T$(LD) --specs=nosys.specs --specs=nano.specs \
            -Wl,-Map=$(OUT)/$(NAME).map -Wl,--gc-sections -static \
            -Wl,--cmse-implib -Wl,--out-implib=$(OUT)/secure_nsclib.o \
@@ -89,3 +89,8 @@ $(OUT)/startup.o: $(ASRC) | $(OUT)
 
 $(OUT):
 	mkdir -p $(OUT)
+
+# Header dependencies (-MMD): a changed .h rebuilds every object including it.
+# Without this a header-only change (e.g. LENS_SWAP_ZOOM_FOCUS) left stale
+# objects - 2026-11-14 the TIM3 IRQ then served the wrong axis and stormed.
+-include $(OBJ:.o=.d)

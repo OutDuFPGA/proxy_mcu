@@ -170,7 +170,8 @@ static void CLI_DisplayMenu(void) {
   CLI_Print("  <color>_on / _off     - e.g. red_on, green_off\r\n");
   CLI_Print("  --- Lens (J11): zoom / focus steppers, pos in microsteps ---\r\n");
   CLI_Print("  lens [status]         - positions, motion state, driver config\r\n");
-  CLI_Print("  lens <z|f> goto <pos> / rel <d> / jog <1|0> [pps] / stop\r\n");
+  CLI_Print("  lens f goto <pos> / rel <d> / jog <1|0> [pps] / stop / home / best\r\n");
+  CLI_Print("  lens z lock [pos] | unlock  - zoom is locked at a fixed step by default\r\n");
   CLI_Print("  lens help             - full lens command list (tuning, limits, regs)\r\n");
   CLI_Print("  zoom_run|focus_run <dir> <step_hz>, *_stop  - legacy jog\r\n");
   CLI_Print("  --- IR LED: ch0 = J5, ch1 = J6 (prefix optional, default ch0) ---\r\n");
@@ -219,6 +220,11 @@ static void CLI_Process_Command(char *cmd) {
 static void Lens_Event(LensAxis_t ax, int32_t pos, const char *reason)
 {
   char b[64];
+  if (!strcmp(reason, "ready")) {      /* boot homing finished */
+    HostLink_Print("READY\n");
+    CLI_Print("\r\n[LENS] ready: zoom fixed, focus at best\r\nMCU> ");
+    return;
+  }
   if (ax == LENS_ZOOM || ax == LENS_FOCUS) {
     snprintf(b, sizeof b, "DONE %c %ld %s\n", ax == LENS_ZOOM ? 'Z' : 'F', (long)pos, reason);
     HostLink_Print(b);

@@ -1,31 +1,22 @@
 /**
   ******************************************************************************
   * @file    lens_ctrl.c
-  * @brief   Zoom / focus (/ iris) stepper control - see lens_ctrl.h.
+  * @brief   Zoom / focus stepper control - see lens_ctrl.h.
   *
-  * Replaces the bring-up TMC2300.c, which:
-  *  - configured only UART node 0 (on the board that is the IRIS driver),
-  *  - read registers one byte late (returned data[23:0]<<8 | CRC),
-  *  - wrote CHOPCONF 0x10000002 (enabledrv = 0, MRES = 256) and
-  *    PWMCONF 0xFF (autoscale off), IRUN = 31 (>10x the lens motor rating),
-  *  - had no step counting, no ramp and no position.
+  * Layers, bottom up:
+  *   1. TMC2300 UART   tmc_write / tmc_read / drv_config
+  *   2. Step engine    one timer per axis, one STEP pulse per timer period,
+  *                     trapezoidal ramp recomputed in the update interrupt
+  *   3. Motion API     LENS_MoveTo / MoveRel / Jog / Stop / Halt / home / zero
+  *   4. Front ends     console (LENS_CLI) and SoC line protocol (LENS_HostCommand)
   *
-  * TMC2300 notes (verify against the datasheet when tuning; every value below
-  * can be changed at run time with "lens <ax> reg/cur/mres/..."):
-  *  - single-wire UART on PDN_UART, node address from AD0/AD1. Schematic:
-  *    zoom U1 = 0, focus U2 = 1, iris U5 = 2 (assembly may differ - "lens scan").
-  *  - IFCNT (0x02) counts successful writes - used to prove each write landed.
-  *  - CHOPCONF (0x6C): bit0 enabledrv, MRES bits 27:24 (0=256 .. 4=16 .. 8=full),
-  *    bit28 intpol. Reset default 0x13008001.
-  *  - PWMCONF (0x70): reset default 0xC40D1024 (pwm_autoscale + autograd on),
-  *    which makes StealthChop regulate to IRUN.
-  *  - IHOLD_IRUN (0x10): IHOLD 4:0, IRUN 12:8, IHOLDDELAY 19:16. Write-only.
-  *    I_RMS = (CS+1)/32 * 0.325 V / (Rsense + 30 mOhm) / sqrt2 (datasheet 9);
-  *    150 mOhm -> ~40 mA RMS per CS step. Datasheet: IRUN < 8 not recommended.
-  *    The 40 ohm lens coils cap the current at ~VS/40 anyway (~80 mA at 3.3 V,
-  *    ~125 mA at 5 V), so IRUN 16 is coil-limited, not sense-limited.
-  *  - GSTAT bit2 u3v5 is a LIVE comparator: VS < 3.5 V (3.15..3.5 V falling).
-  *    The motor is rated 4.0 V +-20 %, so VS ~3.3 V gives marginal torque.
+  * TMC2300 facts this relies on (docs/ and memory notes):
+  *  - CHOPCONF bit0 enabledrv, MRES bits 27:24 (4 = 16 usteps). Reset 0x13008001.
+  *  - Voltage mode PWMCONF 0xC40100FF (autoscale off, PWM_OFS 255): the 40 ohm
+  *    coils at VS 3.3 V cannot reach a current-regulation target.
+  *  - IFCNT (0x02) counts accepted writes - used to verify the config landed.
+  *  - GSTAT u3v5 (bit 2) is a live VS < 3.5 V flag; on this board it is
+  *    expected (VS = 3.3 V), and DRV_STATUS ola/olb read set in voltage mode.
   ******************************************************************************
   */
 #include "lens_ctrl.h"
@@ -38,180 +29,78 @@
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
-#include <stddef.h>
-
-/* ---------------------------------------------------------------- pins --- */
-#ifndef IRIS_DIAG_Pin
-  #define IRIS_DIAG_Pin GPIO_PIN_13
-  #define IRIS_DIAG_GPIO_Port GPIOB
-#endif
-#ifndef FOCUS_DIAG_Pin
-  #define FOCUS_DIAG_Pin GPIO_PIN_9
-  #define FOCUS_DIAG_GPIO_Port GPIOC
-#endif
-#ifndef ZOOM_DIAG_Pin
-  #define ZOOM_DIAG_Pin GPIO_PIN_12
-  #define ZOOM_DIAG_GPIO_Port GPIOC
-#endif
 
 /* ------------------------------------------------------ TMC2300 registers */
-#define R_GCONF       0x00
 #define R_GSTAT       0x01
 #define R_IFCNT       0x02
-#define R_IOIN        0x06
 #define R_IHOLD_IRUN  0x10
 #define R_TPOWERDOWN  0x11
-#define R_TSTEP       0x12
 #define R_TCOOLTHRS   0x14
-#define R_VACTUAL     0x22
 #define R_SGTHRS      0x40
-#define R_SG_VALUE    0x41
 #define R_CHOPCONF    0x6C
 #define R_DRV_STATUS  0x6F
 #define R_PWMCONF     0x70
-#define R_PWM_SCALE   0x71
-#define R_PWM_AUTO    0x72
 
-#define CHOPCONF_DEFAULT  0x13008001u   /* TMC2300 reset value            */
-#define PWMCONF_DEFAULT   0xC40D1024u   /* autoscale + autograd on        */
+#define CHOPCONF_16US  ((0x13008001u & ~(0xFu << 24)) | (4u << 24))  /* MRES 16, enabled */
+#define PWMCONF_VOLT   0xC40100FFu
+#define MRES           16
 
-/* --------------------------------------------- lens motor limits (datasheet) */
-#define LENS_START_PPS_MAX   800u    /* max starting frequency, full steps */
-#define LENS_SLEW_PPS_MAX   1200u    /* max slewing frequency, full steps  */
+/* ------------------------------------------------------------- tunables */
+#define TICK_HZ          1000000.0f   /* TIM3/4/8 at 64 MHz / 64               */
+#define ARR_MIN                 9u    /* STEP output capped at 100 kHz         */
+#define ARR_MAX             65535u    /* slowest rate ~15 Hz                   */
+#define MOTOR_IRQ_PRIO          3u
+#define PPS_START_MAX         800u    /* lens datasheet                        */
+#define PPS_SLEW_MAX         1200u
+#define JOG_MAX_MS          30000u    /* console jog stops by itself           */
+#define POS_FAR      (INT32_MAX / 4)
 
-#define DEF_START_PPS        400u
-#define DEF_MAX_PPS         1000u
-#define DEF_ACC_PPS2        2000u
-#define DEF_MRES              16u
-#define DEF_IRUN              16u   /* datasheet: IRUN < 8 not recommended */
-#define DEF_IHOLD              0u
-#define DEF_IHOLDDELAY         4u
-
-#define TICK_HZ          1000000.0f  /* TIM3/4/8: 64 MHz / (63+1)          */
-#define ARR_MIN                9u    /* 100 kHz cap on the STEP output     */
-#define ARR_MAX            65535u
-#define MOTOR_IRQ_PRIO         3u    /* below IR (0..2) and console UART   */
-
-#define POS_FAR   (INT32_MAX / 2)
-
-/* --------------------------------------------------- guard-rail tunables --
-   See docs/lens-control-design.md. All of these are also run-time settable. */
-#define DEF_HOME_PPS          300u    /* homing speed, full steps/s (<= start)    */
-#define DEF_HOME_MAX_FS      2500u    /* max homing travel, full steps (> travel) */
-#define DEF_HOME_BACKOFF_FS     8u    /* zero = this far off the hard stop        */
-#define DEF_TRAVEL_FS        2500u    /* forward limit until travel is calibrated */
-#define STALL_BLANK_FS          8u    /* ignore DIAG for the first n full steps   */
-#define MOVE_TIMEOUT_SLACK_MS 1500u   /* added to the slowest-case move time      */
-#define JOG_DEADMAN_HOST_MS    600u   /* host jog must be refreshed within this   */
-#define JOG_MAX_CONSOLE_MS   30000u   /* console jog hard time limit              */
-#define HEAT_LIMIT_MS       120000u   /* motor duty bucket: refuse motion above   */
-#define HEAT_ABORT_MS       180000u   /* ...and stop a running move above this    */
-#define HEALTH_PERIOD_MS       100u   /* one driver register poll per period      */
-#define COMM_FAIL_LIMIT          5u   /* consecutive GSTAT read failures -> fault */
-#define UV_SPEED_CAP_PPS       600u   /* max speed while VS < 3.5 V (u3v5)        */
-
-/* Built-in zoom calibration, measured on the bench 2026-11-13 and accepted
-   as the zoom home. Used whenever no valid calibration is saved in flash.
-   Units are firmware microsteps (16/fs); zoom driver U2 currently runs at its
-   reset 32 ustep because its UART is not answering - re-measure once fixed. */
-#define ZOOM_CAL_TRAVEL      16900    /* forward limit: 100 short of the far stop (~17000) */
-#define ZOOM_CAL_HOME_PPS      300u
-#define ZOOM_CAL_HOME_MAX_FS  1130u   /* full search: travel + 1/16 + backoff     */
-#define ZOOM_CAL_BACKOFF_FS      8u   /* zero = 8 fs off the reverse stop         */
-#define ZOOM_CAL_HOME_EXTRA   1232    /* re-home search past zero, usteps         */
-
-/* -------------------------------------------------------------- types --- */
-typedef enum { EVT_NONE = 0, EVT_DONE, EVT_STOP, EVT_LIMIT, EVT_STALL, EVT_DRVERR,
-               EVT_TIMEOUT, EVT_DEADMAN } LensEvt_t;
-static const char *const s_evt_name[] = { "", "done", "stop", "limit", "stall", "drverr",
-                                          "timeout", "deadman" };
-
-/* Axis state machine. Only READY accepts position moves. */
-typedef enum { AX_UNHOMED = 0, AX_HOMING, AX_READY, AX_FAULT } AxState_t;
-static const char *const s_state_name[] = { "UNHOMED", "HOMING", "READY", "FAULT" };
-
-/* Latched faults (cleared only by "lens clr" / host CLR, which re-configures
-   the driver and leaves the axis UNHOMED). */
-#define F_NOCFG    0x0001u   /* driver did not accept/confirm configuration   */
-#define F_DRV      0x0002u   /* DIAG high / GSTAT.drv_err: driver shut down   */
-#define F_OT       0x0004u   /* DRV_STATUS ot / t150: overtemperature         */
-#define F_SHORT    0x0008u   /* DRV_STATUS s2ga/s2gb/s2vsa/s2vsb              */
-#define F_COMM     0x0010u   /* driver stopped answering on the UART          */
-#define F_TIMEOUT  0x0020u   /* move exceeded its worst-case duration         */
-static const char *const s_fault_name[] = { "NOCFG", "DRV", "OT", "SHORT", "COMM", "TIMEOUT" };
-/* Live warnings (not latched). */
-#define W_UV       0x01u     /* VS < 3.5 V: speed capped, torque marginal     */
-#define W_OTPW     0x02u     /* driver >120 C pre-warning: no new moves       */
-#define W_OL       0x04u     /* open-load seen while moving (informative)     */
-#define W_HEAT     0x08u     /* motor duty bucket over limit: no new moves    */
-#define W_TRAVEL   0x10u     /* travel not calibrated: default limit in use   */
-static const char *const s_warn_name[] = { "UV", "OTPW", "OPENLOAD", "HEAT", "TRAVEL?" };
-
-/* Motion request results (shared by console and host). */
-typedef enum { E_OK = 0, E_NODRV, E_FAULT, E_HOME, E_HOT, E_RANGE, E_BUSY } LensErr_t;
-static const char *const s_err_name[] = { "OK", "NODRV", "FAULT", "HOME", "HOT", "RANGE", "BUSY" };
-static LensErr_t s_last_err;
+typedef enum { EVT_NONE = 0, EVT_DONE, EVT_STOP, EVT_LIMIT } Evt_t;
 
 typedef struct {
   /* hardware */
-  TIM_HandleTypeDef *htim;
-  uint32_t           ch;
-  volatile uint32_t *ccr;
-  GPIO_TypeDef *dir_port;  uint16_t dir_pin;
-  GPIO_TypeDef *en_port;   uint16_t en_pin;
-  GPIO_TypeDef *diag_port; uint16_t diag_pin;
-  /* configuration */
-  uint8_t  addr;
-  uint8_t  present;          /* answered on the TMC UART at last init     */
-  uint8_t  configured;       /* every write acknowledged by IFCNT         */
-  uint8_t  allow_nocfg;      /* user override: move even if not configured */
-  const char *drv;           /* "U1" / "U2" / "U5" (schematic designator)  */
-  uint16_t mres;             /* microsteps per full step                  */
-  uint8_t  irun, ihold, iholddelay;
-  uint8_t  sg_thr;           /* 0 = stall detection off                   */
+  const char *drv;
+  TIM_HandleTypeDef *htim; uint32_t ch; volatile uint32_t *ccr; IRQn_Type irq;
+  GPIO_TypeDef *dir_port; uint16_t dir_pin;
+  GPIO_TypeDef *en_port;  uint16_t en_pin;
+  uint8_t addr;
+  bool    fitted;             /* a motor is connected to this driver        */
+  bool    present;            /* answered on the UART at the last config    */
+  bool    configured;         /* all config writes counted by IFCNT         */
+  /* settings */
+  uint8_t  irun, ihold;
   uint32_t start_pps, max_pps, acc_pps2;
+  uint32_t home_pps, home_fs;
+  int32_t  travel;            /* forward soft limit after referencing       */
+  /* reference / limits */
+  bool     referenced;        /* pos 0 is the reverse stop (home or zero)   */
+  bool     limits_on;
   int32_t  min_pos, max_pos;
-  /* motion state (shared with ISR) */
-  volatile int32_t  pos;
-  volatile int32_t  target;
-  volatile int8_t   dir;     /* +1 / -1 while running                     */
-  volatile uint8_t  running;
-  volatile uint8_t  jog;
-  volatile uint8_t  stop_req;
-  volatile uint8_t  evt;
-  float    v, v_start, v_max, acc2;   /* microsteps/s, (microsteps/s)^2 *2 */
-  /* queued move (issued while the axis had to stop/reverse first) */
-  uint8_t  pend_valid;
-  int32_t  pend_target;
-  /* ---- guard rails ---- */
-  uint8_t  state;            /* AxState_t                                  */
-  uint16_t fault;            /* F_* latched                                */
-  uint8_t  warn;             /* W_* live                                   */
-  uint8_t  travel_known;     /* max_pos came from calibration              */
-  uint32_t home_pps, home_max_fs, home_backoff_fs;
-  int32_t  home_extra;       /* re-home search margin past zero, usteps; <0 = auto */
-  uint8_t  home_phase;       /* 0 idle, 1 seeking stop, 2 backing off      */
-  volatile uint8_t homing;   /* ISR: ignore min_pos while seeking the stop */
-  volatile uint32_t steps_run;   /* steps since start (stall blanking)     */
-  uint32_t t_deadline;       /* HAL tick: move must be finished by then    */
-  uint32_t jog_expire;       /* HAL tick: jog deadman                      */
-  uint32_t heat_ms;          /* duty bucket                                */
-  uint8_t  comm_fail;
-  uint8_t  health_phase;
-  volatile uint8_t evt_deadman;
+  /* motion state, shared with the ISR */
+  volatile int32_t pos, target;
+  volatile int8_t  dir;
+  volatile bool    running, jog, stop_req, nolimit;
+  volatile uint8_t evt;
+  float v, v_start, v_max, acc2;   /* usteps/s, 2*usteps/s^2 */
+  /* task-level */
+  uint32_t jog_until;         /* HAL tick, 0 = no time limit                */
+  bool     timed_out;
+  bool     homing;
 } Axis_t;
 
 const char *const LENS_AxisName[LENS_NAXIS] = { "zoom", "focus", "iris" };
 
-static Axis_t s_ax[LENS_NAXIS];
+static Axis_t      s_ax[LENS_NAXIS];
 static LensEventFn s_evt_fn;
-static char s_buf[200];
+static char        s_buf[160];
+
+static bool ax_ok(LensAxis_t ax) { return (unsigned)ax < LENS_NAXIS && s_ax[ax].fitted; }
 
 /* ============================================================ TMC UART === */
 static void tmc_crc(uint8_t *d, uint8_t len)
 {
   uint8_t crc = 0;
-  for (uint8_t i = 0; i < len - 1u; i++) {
+  for (uint8_t i = 0; i + 1u < len; i++) {
     uint8_t b = d[i];
     for (uint8_t j = 0; j < 8u; j++) {
       crc = ((crc >> 7) ^ (b & 1u)) ? (uint8_t)((crc << 1) ^ 0x07u) : (uint8_t)(crc << 1);
@@ -224,20 +113,21 @@ static void tmc_crc(uint8_t *d, uint8_t len)
 static void tmc_write(uint8_t addr, uint8_t reg, uint32_t val)
 {
   uint8_t d[8] = { 0x05, addr, (uint8_t)(reg | 0x80u),
-                   (uint8_t)(val >> 24), (uint8_t)(val >> 16),
-                   (uint8_t)(val >> 8),  (uint8_t)val, 0 };
+                   (uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val, 0 };
   tmc_crc(d, 8);
+  HAL_Delay(2);                        /* idle gap between frames (U1 drops back-to-back writes) */
   HAL_UART_Abort(&huart1);
   HAL_HalfDuplex_EnableTransmitter(&huart1);
   HAL_UART_Transmit(&huart1, d, 8, 50);
 }
 
-/* Reply: sync 0x05, master 0xFF, reg, data[31:24..7:0], CRC. */
+/* Reply frame: 0x05, 0xFF, reg, data[31:0], CRC. */
 static bool tmc_read(uint8_t addr, uint8_t reg, uint32_t *val)
 {
   uint8_t tx[4] = { 0x05, addr, (uint8_t)(reg & 0x7Fu), 0 };
   uint8_t rx[8] = { 0 };
   tmc_crc(tx, 4);
+  HAL_Delay(2);
   HAL_UART_Abort(&huart1);
   __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
   HAL_HalfDuplex_EnableTransmitter(&huart1);
@@ -251,678 +141,128 @@ static bool tmc_read(uint8_t addr, uint8_t reg, uint32_t *val)
   return true;
 }
 
-static uint8_t mres_code(uint16_t mres)
-{
-  switch (mres) {
-    case 256: return 0; case 128: return 1; case 64: return 2; case 32: return 3;
-    case 16:  return 4; case 8:   return 5; case 4:  return 6; case 2:  return 7;
-    default:  return 8;   /* full step */
-  }
-}
-
-static uint32_t axis_chopconf(const Axis_t *a)
-{
-  return (CHOPCONF_DEFAULT & ~(0xFu << 24)) | ((uint32_t)mres_code(a->mres) << 24) | 1u;
-}
-
-/* Writes the full profile and proves it landed: IFCNT must advance by the
-   number of writes and CHOPCONF must read back. */
-static bool axis_configure(Axis_t *a)
+static bool drv_config(Axis_t *a)
 {
   uint32_t c0, c1, chop;
+  a->configured = false;
   a->present = tmc_read(a->addr, R_IFCNT, &c0);
-  a->configured = 0;
   if (!a->present) return false;
-
-  uint32_t ihr = ((uint32_t)a->iholddelay << 16) | ((uint32_t)a->irun << 8) | a->ihold;
-  tmc_write(a->addr, R_GSTAT, 0x7u);                 /* clear reset/drv_err/uv */
-  tmc_write(a->addr, R_IHOLD_IRUN, ihr);
+  tmc_write(a->addr, R_GSTAT, 0x7u);                              /* clear flags  */
+  tmc_write(a->addr, R_IHOLD_IRUN, (4u << 16) | ((uint32_t)a->irun << 8) | a->ihold);
   tmc_write(a->addr, R_TPOWERDOWN, 20u);
-  tmc_write(a->addr, R_PWMCONF, PWMCONF_DEFAULT);
-  /* StallGuard/DIAG only above ~75 % of the homing speed: the datasheet
-     (10.4) calls low-speed StallGuard unreliable. TSTEP is in 1/fCLK per
-     1/256 microstep; stall output is enabled while TCOOLTHRS >= TSTEP.   */
-  uint32_t tcool = 0;
-  if (a->sg_thr) {
-    uint32_t pps = a->home_pps * 3u / 4u;
-    if (pps < 20u) pps = 20u;
-    tcool = 12000000u / (256u * pps);
-    if (tcool > 0xFFFFFu) tcool = 0xFFFFFu;
-  }
-  tmc_write(a->addr, R_TCOOLTHRS, tcool);
-  tmc_write(a->addr, R_SGTHRS, a->sg_thr);
-  tmc_write(a->addr, R_CHOPCONF, axis_chopconf(a));  /* last: enables the driver */
-  const uint8_t n_writes = 7;
-
-  if (!tmc_read(a->addr, R_IFCNT, &c1)) return false;
-  if (!tmc_read(a->addr, R_CHOPCONF, &chop)) return false;
-  a->configured = (((c1 - c0) & 0xFFu) == n_writes) && (chop == axis_chopconf(a));
+  tmc_write(a->addr, R_PWMCONF, PWMCONF_VOLT);
+  tmc_write(a->addr, R_TCOOLTHRS, 0u);                            /* no StallGuard */
+  tmc_write(a->addr, R_SGTHRS, 0u);
+  tmc_write(a->addr, R_CHOPCONF, CHOPCONF_16US);                  /* enables output */
+  if (!tmc_read(a->addr, R_IFCNT, &c1) || !tmc_read(a->addr, R_CHOPCONF, &chop)) return false;
+  a->configured = (((c1 - c0) & 0xFFu) == 7u) && chop == CHOPCONF_16US;
   return a->configured;
 }
 
-/* ============================================================ motion ===== */
-static void axis_rates(Axis_t *a)
-{
-  uint32_t vmax = a->max_pps, vst = a->start_pps;
-  if ((a->warn & W_UV) && vmax > UV_SPEED_CAP_PPS) vmax = UV_SPEED_CAP_PPS;   /* low VS: less torque */
-  if (vst > vmax) vst = vmax;
-  a->v_start = (float)vst * a->mres;
-  a->v_max   = (float)vmax * a->mres;
-  a->acc2    = 2.0f * (float)a->acc_pps2 * a->mres;
-}
-
+/* ========================================================= step engine === */
 static inline uint32_t rate_to_arr(float v)
 {
   float t = TICK_HZ / v;
   uint32_t arr = (t > (float)(ARR_MAX + 1u)) ? ARR_MAX : (uint32_t)t - 1u;
-  return (arr < ARR_MIN) ? ARR_MIN : arr;
+  return arr < ARR_MIN ? ARR_MIN : arr;
 }
 
 static inline void tim_load(Axis_t *a, uint32_t arr)
 {
   a->htim->Instance->ARR = arr;
-  *a->ccr = (arr + 1u) / 2u;          /* PWM2: STEP high for 2nd half */
+  *a->ccr = (arr + 1u) / 2u;          /* PWM2: STEP high in the second half */
 }
 
-/* ISR context (or IRQs masked). Stops the counter; if the pulse of the period
-   that had just begun already went high, it counts as a step. */
-static void axis_finish(Axis_t *a, LensEvt_t why)
+/* ISR context or IRQ masked. */
+static void axis_finish(Axis_t *a, Evt_t why)
 {
   TIM_TypeDef *T = a->htim->Instance;
   T->CR1 &= ~TIM_CR1_CEN;
-  if (T->CNT >= *a->ccr) a->pos += a->dir;
+  if (T->CNT >= *a->ccr) a->pos += a->dir;   /* pulse of this period already went high */
   T->CNT = 0;
-  a->running = 0;
-  a->stop_req = 0;
+  a->running = false;
+  a->stop_req = false;
   a->evt = (uint8_t)why;
 }
 
-static void axis_start(Axis_t *a, int dir, bool jog, int32_t target)
+static void axis_start(Axis_t *a, int dir, bool jog, int32_t target, uint32_t max_pps)
 {
-  TIM_TypeDef *T = a->htim->Instance;
+  uint32_t vmax = max_pps ? max_pps : a->max_pps;
+  uint32_t vst  = a->start_pps < vmax ? a->start_pps : vmax;
+  a->v_start = (float)vst * MRES;
+  a->v_max   = (float)vmax * MRES;
+  a->acc2    = 2.0f * (float)a->acc_pps2 * MRES;
+
   a->dir = (int8_t)(dir > 0 ? 1 : -1);
   HAL_GPIO_WritePin(a->dir_port, a->dir_pin, dir > 0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(a->en_port, a->en_pin, GPIO_PIN_SET);
   for (volatile int i = 0; i < 20; i++) { __NOP(); }   /* DIR setup time */
 
-  a->jog = jog ? 1u : 0u;
+  a->jog = jog;
   a->target = target;
-  a->stop_req = 0;
+  a->stop_req = false;
   a->evt = EVT_NONE;
+  a->timed_out = false;
   a->v = a->v_start;
-  a->steps_run = 0;
 
-  /* Worst case: the whole distance at the start speed, plus slack. A move
-     still running after this is a firmware/hardware fault, not a slow move. */
-  uint32_t now = HAL_GetTick();
-  if (jog) {
-    a->t_deadline = a->jog_expire + MOVE_TIMEOUT_SLACK_MS;
-  } else {
-    uint32_t dist = (uint32_t)abs(target - a->pos);
-    a->t_deadline = now + (uint32_t)((float)dist * 1000.0f / a->v_start) + MOVE_TIMEOUT_SLACK_MS;
-  }
-
+  TIM_TypeDef *T = a->htim->Instance;
   T->CR1 &= ~TIM_CR1_CEN;
   T->CNT = 0;
   tim_load(a, rate_to_arr(a->v));
-  T->EGR = TIM_EGR_UG;                 /* URS=1: no update IRQ from this */
+  T->EGR = TIM_EGR_UG;                 /* URS = 1: no interrupt from this */
   T->SR = ~TIM_SR_UIF;
-  a->running = 1;
+  a->running = true;
   T->CR1 |= TIM_CR1_CEN;
 }
 
 void LENS_TimerIRQ(LensAxis_t ax)
 {
+  if ((unsigned)ax >= LENS_NAXIS) return;
   Axis_t *a = &s_ax[ax];
   TIM_TypeDef *T = a->htim->Instance;
   if ((T->SR & TIM_SR_UIF) == 0u) return;
   T->SR = ~TIM_SR_UIF;
   if (!a->running) { T->CR1 &= ~TIM_CR1_CEN; return; }
 
-  /* one complete STEP pulse just ended */
-  int32_t pos = a->pos + a->dir;
+  int32_t pos = a->pos + a->dir;       /* one complete STEP pulse just ended */
   a->pos = pos;
-  uint32_t n = ++a->steps_run;
 
-  /* DIAG high = driver shut down (short/overtemp) or StallGuard stall.
-     Blanked for the first few full steps (start-up transient). Classified
-     afterwards from DRV_STATUS in LENS_Task. */
-  if (n > STALL_BLANK_FS * a->mres && (a->diag_port->IDR & a->diag_pin)) {
-    axis_finish(a, EVT_DRVERR);
-    return;
-  }
-
-  /* distance left: to target (move) and to the soft limit (both modes).
-     While homing, the reverse limit is ignored - the hard stop is the goal. */
-  int32_t to_lim = (a->dir > 0) ? (a->max_pos - pos) :
-                   a->homing ? INT32_MAX / 4 : (pos - a->min_pos);
+  int32_t to_lim = POS_FAR;
+  if (a->limits_on && !a->nolimit) to_lim = a->dir > 0 ? a->max_pos - pos : pos - a->min_pos;
   int32_t rem = a->jog ? to_lim : (a->target - pos) * a->dir;
-  if (!a->jog && rem > to_lim) rem = to_lim;
+  if (rem > to_lim) rem = to_lim;
 
   if (rem <= 0) {
-    LensEvt_t why = (!a->jog && pos == a->target) ? EVT_DONE : EVT_LIMIT;
-    axis_finish(a, why);
+    axis_finish(a, (!a->jog && pos == a->target) ? EVT_DONE : EVT_LIMIT);
     return;
   }
 
-  float v2 = a->v * a->v;
-  float vs2 = a->v_start * a->v_start;
-  float dec_steps = (v2 - vs2) / a->acc2;          /* steps needed to slow to v_start */
-
-  if (a->stop_req || (float)rem <= dec_steps + 1.0f) {
+  float v2 = a->v * a->v, vs2 = a->v_start * a->v_start, vm2 = a->v_max * a->v_max;
+  bool decel = a->stop_req || (float)rem <= (v2 - vs2) / a->acc2 + 1.0f;
+  if (decel) {
     v2 -= a->acc2;
     if (v2 <= vs2) {
       v2 = vs2;
       if (a->stop_req) { axis_finish(a, EVT_STOP); return; }
     }
-  } else if (a->v < a->v_max) {
+  } else if (v2 < vm2) {
     v2 += a->acc2;
-    if (v2 > a->v_max * a->v_max) v2 = a->v_max * a->v_max;
-  } else if (a->v > a->v_max) {                    /* speed lowered mid-move */
-    v2 -= a->acc2;
-    if (v2 < a->v_max * a->v_max) v2 = a->v_max * a->v_max;
+    if (v2 > vm2) v2 = vm2;
   }
   a->v = sqrtf(v2);
-  tim_load(a, rate_to_arr(a->v));                  /* applies from the period after next */
+  tim_load(a, rate_to_arr(a->v));      /* preloaded: applies next period */
 }
 
-static bool ax_ok(LensAxis_t ax) { return (unsigned)ax < LENS_NAXIS; }
-
-/* ===================================================== zoom/focus tracking ==
-   Calibration table: per point a zoom position and the in-focus focus
-   position for objects at infinity, 3 m, 1 m and 0.3 m (any may be unset).
-   Focus is interpolated linearly in zoom position between points and
-   linearly in object vergence (diopters = 1/m) between the distance columns,
-   which is how image-side focus shift scales (~f^2/u).
-   Follow mode: a zoom move/jog also drives focus to the table value for the
-   new zoom position, at the object distance implied by where focus sat
-   before the zoom started (so a manually focused subject stays sharp). */
-#define TRK_MAX     16
-#define TRK_COLS     4
-#define TRK_UNSET   INT32_MIN
-static const float    s_col_dpt[TRK_COLS] = { 0.0f, 1.0f / 3.0f, 1.0f, 1.0f / 0.3f };
-static const char *const s_col_name[TRK_COLS] = { "inf", "3m", "1m", "0.3m" };
-
-typedef struct { uint8_t used; int32_t zoom; int32_t focus[TRK_COLS]; } TrkPt_t;
-static TrkPt_t  s_trk[TRK_MAX];
-static uint8_t  s_trk_follow;
-static float    s_trk_dpt;          /* object vergence focus is held at (diopters) */
-
-static bool move_to_raw(LensAxis_t ax, int32_t pos);
-
-/* Sorted indices of points that have at least one focus column set. */
-static int trk_sorted(uint8_t *idx)
-{
-  int n = 0;
-  for (int i = 0; i < TRK_MAX; i++) {
-    if (!s_trk[i].used) continue;
-    bool any = false;
-    for (int c = 0; c < TRK_COLS; c++) if (s_trk[i].focus[c] != TRK_UNSET) any = true;
-    if (!any) continue;
-    int j = n++;
-    while (j > 0 && s_trk[idx[j - 1]].zoom > s_trk[i].zoom) { idx[j] = idx[j - 1]; j--; }
-    idx[j] = (uint8_t)i;
-  }
-  return n;
-}
-
-/* Focus at one table point for vergence d: piecewise linear over the set
-   columns, clamped at the nearest set column outside their span. */
-static float trk_point_focus(const TrkPt_t *p, float d)
-{
-  int lo = -1, hi = -1;
-  for (int c = 0; c < TRK_COLS; c++) {
-    if (p->focus[c] == TRK_UNSET) continue;
-    if (s_col_dpt[c] <= d) lo = c;
-    if (s_col_dpt[c] >= d && hi < 0) hi = c;
-  }
-  if (lo < 0) return (float)p->focus[hi];
-  if (hi < 0 || hi == lo) return (float)p->focus[lo];
-  float t = (d - s_col_dpt[lo]) / (s_col_dpt[hi] - s_col_dpt[lo]);
-  return (float)p->focus[lo] + t * (float)(p->focus[hi] - p->focus[lo]);
-}
-
-/* Focus for zoom position z at vergence d. false if the table is empty. */
-static bool trk_focus(int32_t z, float d, int32_t *out)
-{
-  uint8_t idx[TRK_MAX];
-  int n = trk_sorted(idx);
-  if (n == 0) return false;
-  int k = 0;
-  while (k < n - 1 && s_trk[idx[k + 1]].zoom <= z) k++;
-  const TrkPt_t *a = &s_trk[idx[k]];
-  float fa = trk_point_focus(a, d), f;
-  if (n == 1 || z <= a->zoom || k == n - 1) {
-    f = fa;                                   /* clamp outside the table */
-  } else {
-    const TrkPt_t *b = &s_trk[idx[k + 1]];
-    float t = (float)(z - a->zoom) / (float)(b->zoom - a->zoom);
-    f = fa + t * (trk_point_focus(b, d) - fa);
-  }
-  *out = (int32_t)lroundf(f);
-  return true;
-}
-
-/* Inverse: which object vergence puts focus f in focus at zoom z. */
-static bool trk_dpt_from(int32_t z, int32_t f, float *d_out)
-{
-  float g[TRK_COLS];
-  for (int c = 0; c < TRK_COLS; c++) {
-    int32_t v;
-    if (!trk_focus(z, s_col_dpt[c], &v)) return false;
-    g[c] = (float)v;
-  }
-  float ff = (float)f;
-  /* Pick the segment containing f; else clamp to the nearer end. */
-  for (int c = 0; c < TRK_COLS - 1; c++) {
-    float a = g[c], b = g[c + 1];
-    if ((ff - a) * (ff - b) <= 0.0f) {
-      float t = (b == a) ? 0.0f : (ff - a) / (b - a);
-      *d_out = s_col_dpt[c] + t * (s_col_dpt[c + 1] - s_col_dpt[c]);
-      return true;
-    }
-  }
-  *d_out = (fabsf(ff - g[0]) <= fabsf(ff - g[TRK_COLS - 1])) ? s_col_dpt[0] : s_col_dpt[TRK_COLS - 1];
-  return true;
-}
-
-static int32_t axis_goal(const Axis_t *a)
-{
-  return a->pend_valid ? a->pend_target : (a->running && !a->jog) ? a->target : a->pos;
-}
-
-/* Before a zoom motion starts: remember the subject distance focus is at. */
-static void trk_capture(void)
-{
-  Axis_t *z = &s_ax[LENS_ZOOM], *f = &s_ax[LENS_FOCUS];
-  if (!s_trk_follow || z->running || z->pend_valid || f->running || f->pend_valid) return;
-  float d;
-  if (trk_dpt_from(z->pos, f->pos, &d)) s_trk_dpt = d;
-}
-
-/* Drive focus to the table value for zoom position zpos. */
-static void trk_focus_to(int32_t zpos)
-{
-  Axis_t *f = &s_ax[LENS_FOCUS];
-  int32_t t;
-  if (!s_trk_follow || !trk_focus(zpos, s_trk_dpt, &t)) return;
-  if (t < f->min_pos) t = f->min_pos;
-  if (t > f->max_pos) t = f->max_pos;
-  if (t != axis_goal(f)) move_to_raw(LENS_FOCUS, t);
-}
-
-bool LENS_MoveTo(LensAxis_t ax, int32_t pos)
-{
-  if (ax == LENS_ZOOM) trk_capture();
-  bool ok = move_to_raw(ax, pos);
-  if (ok && ax == LENS_ZOOM) trk_focus_to(pos);
-  return ok;
-}
-
-/* Track distance in mm (0 = infinity): hold focus there and refocus now. */
-static void trk_set_distance(uint32_t mm)
-{
-  s_trk_dpt = mm ? 1000.0f / (float)mm : 0.0f;
-  bool f = s_trk_follow;
-  s_trk_follow = 1;
-  trk_focus_to(axis_goal(&s_ax[LENS_ZOOM]));
-  s_trk_follow = f;
-}
-
-/* ---------------------------------------------------------- motion gate --
-   Every motion request passes here. need_home: position moves (absolute or
-   relative) need a referenced axis; console calibration jogs do not.
-   "lens <ax> allow on" (console test mode) bypasses NODRV and HOME only -
-   faults, heat, soft limits, timeouts and the jog dead-man stay active.   */
-static LensErr_t gate(const Axis_t *a, bool need_home)
-{
-  if (!a->configured && !a->allow_nocfg)                 return E_NODRV;
-  if (a->fault)                                          return E_FAULT;
-  if (a->state == AX_HOMING)                             return E_BUSY;
-  if (need_home && a->state != AX_READY && !a->allow_nocfg) return E_HOME;
-  if (a->warn & (W_HEAT | W_OTPW))                       return E_HOT;
-  return E_OK;
-}
-
-static bool move_to_raw(LensAxis_t ax, int32_t pos)
-{
-  if (!ax_ok(ax)) { s_last_err = E_RANGE; return false; }
-  Axis_t *a = &s_ax[ax];
-  if ((s_last_err = gate(a, true)) != E_OK) return false;
-  if (pos < a->min_pos || pos > a->max_pos) { s_last_err = E_RANGE; return false; }
-
-  if (a->running) {
-    /* Same direction and still ahead of where a decelerated stop would land:
-       retarget on the fly. Otherwise stop first and queue the move. */
-    int32_t ahead = (pos - a->pos) * a->dir;
-    float dec = (a->v * a->v - a->v_start * a->v_start) / a->acc2;
-    if (!a->jog && ahead > (int32_t)dec + 2) {
-      a->target = pos;
-      uint32_t dist = (uint32_t)abs(pos - a->pos);
-      a->t_deadline = HAL_GetTick() + (uint32_t)((float)dist * 1000.0f / a->v_start) + MOVE_TIMEOUT_SLACK_MS;
-      return true;
-    }
-    a->pend_target = pos;
-    a->pend_valid = 1;
-    a->stop_req = 1;
-    return true;
-  }
-  a->pend_valid = 0;
-  if (pos == a->pos) { a->evt = EVT_DONE; return true; }
-  axis_rates(a);
-  axis_start(a, pos > a->pos ? 1 : -1, false, pos);
-  return true;
-}
-
-bool LENS_MoveRel(LensAxis_t ax, int32_t delta)
-{
-  if (!ax_ok(ax)) return false;
-  return LENS_MoveTo(ax, axis_goal(&s_ax[ax]) + delta);
-}
-
-/* Jog: runs until stopped, a soft limit, or the dead-man expires.
-   pps 0 = configured max speed; the jog speed never changes the profile. */
-static bool jog_start(LensAxis_t ax, int dir, uint32_t pps, uint32_t deadman_ms, bool need_home)
-{
-  if (!ax_ok(ax)) { s_last_err = E_RANGE; return false; }
-  Axis_t *a = &s_ax[ax];
-  if ((s_last_err = gate(a, need_home)) != E_OK) return false;
-  int d = dir ? 1 : -1;
-  if (ax == LENS_ZOOM) trk_capture();
-  if (a->running) {
-    if (a->dir == d && a->jog) {                     /* refresh the dead-man */
-      a->jog_expire = HAL_GetTick() + deadman_ms;
-      a->t_deadline = a->jog_expire + MOVE_TIMEOUT_SLACK_MS;
-      return true;
-    }
-    s_last_err = E_BUSY;
-    return false;
-  }
-  if ((d > 0 && a->pos >= a->max_pos) || (d < 0 && a->pos <= a->min_pos)) { s_last_err = E_RANGE; return false; }
-  axis_rates(a);
-  if (pps) {
-    if (pps > LENS_SLEW_PPS_MAX) pps = LENS_SLEW_PPS_MAX;
-    float v = (float)pps * a->mres;
-    if (v < a->v_max) a->v_max = v;
-    if (a->v_start > a->v_max) a->v_start = a->v_max;
-  }
-  a->pend_valid = 0;
-  a->jog_expire = HAL_GetTick() + deadman_ms;
-  axis_start(a, d, true, 0);
-  return true;
-}
-
-bool LENS_Jog(LensAxis_t ax, int dir, uint32_t pps)
-{
-  return jog_start(ax, dir, pps, JOG_MAX_CONSOLE_MS, false);
-}
-
-void LENS_Stop(LensAxis_t ax)
-{
-  if (!ax_ok(ax)) return;
-  s_ax[ax].pend_valid = 0;
-  if (s_ax[ax].running) s_ax[ax].stop_req = 1;
-}
-
-void LENS_Halt(LensAxis_t ax)
-{
-  if (!ax_ok(ax)) return;
-  Axis_t *a = &s_ax[ax];
-  a->pend_valid = 0;
-  uint32_t pm = __get_PRIMASK();
-  __disable_irq();
-  if (a->running) axis_finish(a, EVT_STOP);
-  __set_PRIMASK(pm);
-}
-
-bool    LENS_IsMoving(LensAxis_t ax) { return ax_ok(ax) && (s_ax[ax].running || s_ax[ax].pend_valid); }
-int32_t LENS_GetPos(LensAxis_t ax)   { return ax_ok(ax) ? s_ax[ax].pos : 0; }
-void    LENS_SetEventHandler(LensEventFn fn) { s_evt_fn = fn; }
-
-static void emit(int i, const char *reason)
-{
-  if (s_evt_fn) s_evt_fn((LensAxis_t)i, s_ax[i].pos, reason);
-}
-
-/* Latch a fault: stop now, drop the reference, notify. */
-static void axis_fault(int i, uint16_t f)
-{
-  Axis_t *a = &s_ax[i];
-  bool fresh = (a->fault & f) != f;
-  LENS_Halt((LensAxis_t)i);
-  a->fault |= f;
-  a->state = AX_FAULT;
-  a->homing = 0; a->home_phase = 0;
-  if (fresh) {
-    for (unsigned b = 0; b < 6; b++) if (f & (1u << b)) {
-      char r[24]; snprintf(r, sizeof r, "fault-%s", s_fault_name[b]); emit(i, r);
-    }
-  }
-}
-
-/* Position can no longer be trusted (stall, driver reset): needs re-homing. */
-static void axis_unref(int i, const char *why)
-{
-  Axis_t *a = &s_ax[i];
-  if (a->state == AX_READY || a->state == AX_HOMING) a->state = AX_UNHOMED;
-  a->homing = 0; a->home_phase = 0;
-  emit(i, why);
-}
-
-/* --------------------------------------------------------------- homing --
-   No limit switches: reference against the lens' reverse mechanical stop.
-   Phase 1 drives reverse at a low speed for at most home_max_fs full steps
-   (more than the whole travel), ending at the hard stop either by stall
-   detection (if tuned) or by running out the distance - the motor just
-   slips at the stop, current is coil-limited (~VS/40 ohm). Phase 2 backs
-   off home_backoff_fs and defines that point as position 0.              */
-/* Homing search distance tracks the travel: just over one full travel, so
-   from anywhere inside the range the stop is reached, and from the stop the
-   motor slips for at most ~1/16 travel + backoff. */
-static void home_fit_travel(Axis_t *a)
-{
-  uint32_t t = (uint32_t)(a->max_pos / (int32_t)a->mres);
-  a->home_max_fs = t + t / 16u + a->home_backoff_fs;
-}
-
-static void home_speed(Axis_t *a)
-{
-  axis_rates(a);
-  a->v_start = a->v_max = (float)a->home_pps * a->mres;
-}
-
-static LensErr_t LENS_Home(LensAxis_t ax)
-{
-  if (!ax_ok(ax)) return E_RANGE;
-  Axis_t *a = &s_ax[ax];
-  if (!a->configured && !a->allow_nocfg) return E_NODRV;
-  if (a->fault) return E_FAULT;
-  if (a->running || a->state == AX_HOMING) return E_BUSY;
-  if (a->warn & (W_HEAT | W_OTPW)) return E_HOT;
-  /* Already referenced: the stop is pos + backoff away - search only that
-     plus a margin, so re-homing barely loads the hard stop. Otherwise the
-     full home_max_fs (position unknown). */
-  uint32_t seek_fs = a->home_max_fs;
-  if (a->state == AX_READY && a->pos >= 0) {
-    uint32_t t = (uint32_t)(a->max_pos / (int32_t)a->mres);
-    uint32_t extra_fs = (a->home_extra >= 0) ? ((uint32_t)a->home_extra + a->mres - 1u) / a->mres
-                                             : 4u + t / 64u;
-    uint32_t want = (uint32_t)(a->pos / (int32_t)a->mres) + a->home_backoff_fs + extra_fs;
-    if (want < seek_fs) seek_fs = want;
-  }
-  a->pend_valid = 0;
-  a->state = AX_HOMING;
-  a->home_phase = 1;
-  a->homing = 1;
-  home_speed(a);
-  axis_start(a, -1, false, a->pos - (int32_t)(seek_fs * a->mres));
-  return E_OK;
-}
-
-static void home_step(int i, uint8_t evt, bool stalled)
-{
-  Axis_t *a = &s_ax[i];
-  if (a->home_phase == 1 && (evt == EVT_DONE || stalled)) {
-    a->homing = 0;
-    a->pos = -(int32_t)(a->home_backoff_fs * a->mres);      /* at the hard stop */
-    a->home_phase = 2;
-    home_speed(a);
-    axis_start(a, +1, false, 0);
-    return;
-  }
-  if (a->home_phase == 2 && evt == EVT_DONE) {
-    a->home_phase = 0;
-    a->state = AX_READY;
-    emit(i, "homed");
-    return;
-  }
-  a->home_phase = 0; a->homing = 0;                          /* aborted */
-  a->state = AX_UNHOMED;
-  emit(i, "home-abort");
-}
-
-/* ------------------------------------------------------- health monitor --
-   One UART register read per HEALTH_PERIOD_MS, round-robin over present
-   drivers, alternating GSTAT and DRV_STATUS (datasheet ch. 14):
-   - GSTAT.reset     driver lost its config -> reconfigure, UNHOMED
-   - GSTAT.drv_err   driver shut down       -> fault DRV
-   - GSTAT.u3v5      VS < 3.5 V (live)      -> warn UV, speed capped
-   - DRV_STATUS ot/t150 -> fault OT; s2g/s2vs -> fault SHORT;
-     otpw/t120 -> warn OTPW (no new moves); ola/olb while moving -> warn OL
-   - COMM_FAIL_LIMIT consecutive GSTAT read failures -> fault COMM       */
-static bool axis_configure(Axis_t *a);
-
-static void health_poll(void)
-{
-  static uint32_t t_next;
-  static uint8_t rr;
-  uint32_t now = HAL_GetTick();
-  if ((int32_t)(now - t_next) < 0) return;
-  t_next = now + HEALTH_PERIOD_MS;
-
-  for (int k = 0; k < LENS_NAXIS; k++) {
-    int i = (rr + k) % LENS_NAXIS;
-    Axis_t *a = &s_ax[i];
-    if (!a->configured) continue;
-    rr = (uint8_t)((i + 1) % LENS_NAXIS);
-    uint32_t v;
-    if ((a->health_phase ^= 1u) != 0u) {
-      if (!tmc_read(a->addr, R_GSTAT, &v)) {
-        if (++a->comm_fail >= COMM_FAIL_LIMIT) axis_fault(i, F_COMM);
-        return;
-      }
-      a->comm_fail = 0;
-      if (v & 4u) a->warn |= W_UV; else a->warn &= (uint8_t)~W_UV;
-      if (v & 2u) axis_fault(i, F_DRV);
-      if (v & 1u) {                      /* driver reset: config is gone */
-        LENS_Halt((LensAxis_t)i);
-        axis_configure(a);
-        if (!a->configured) axis_fault(i, F_NOCFG);
-        else axis_unref(i, "driver-reset");
-      }
-    } else if (tmc_read(a->addr, R_DRV_STATUS, &v)) {
-      if (v & ((1u << 9) | (1u << 1))) axis_fault(i, F_OT);
-      if (v & 0x3Cu)                   axis_fault(i, F_SHORT);
-      if (v & ((1u << 8) | 1u)) a->warn |= W_OTPW; else a->warn &= (uint8_t)~W_OTPW;
-      if (a->running && (v & 0xC0u)) a->warn |= W_OL;
-    }
-    return;
-  }
-}
-
-/* DIAG went high during a move: driver error, or a stall (StallGuard on). */
-static bool classify_diag(int i)
-{
-  Axis_t *a = &s_ax[i];
-  uint32_t ds = 0, gs = 0;
-  bool have = tmc_read(a->addr, R_DRV_STATUS, &ds);
-  (void)tmc_read(a->addr, R_GSTAT, &gs);
-  if (have && (ds & ((1u << 9) | (1u << 1)))) { axis_fault(i, F_OT);    return false; }
-  if (have && (ds & 0x3Cu))                   { axis_fault(i, F_SHORT); return false; }
-  if ((gs & 2u) || a->sg_thr == 0u)           { axis_fault(i, F_DRV);   return false; }
-  return true;                                   /* StallGuard stall */
-}
-
-void LENS_Task(void)
-{
-  uint32_t now = HAL_GetTick();
-  static uint32_t t_prev;
-  uint32_t dt = now - t_prev;
-  t_prev = now;
-
-  for (int i = 0; i < LENS_NAXIS; i++) {
-    Axis_t *a = &s_ax[i];
-
-    /* motor duty bucket: fills while running, drains at half rate idle */
-    if (a->running) a->heat_ms += dt;
-    else a->heat_ms = (a->heat_ms > dt / 2u) ? a->heat_ms - dt / 2u : 0u;
-    if (a->heat_ms > HEAT_LIMIT_MS) a->warn |= W_HEAT;
-    else if (a->heat_ms < HEAT_LIMIT_MS / 2u) a->warn &= (uint8_t)~W_HEAT;
-    if (a->running && a->heat_ms > HEAT_ABORT_MS) LENS_Stop((LensAxis_t)i);
-
-    if (a->running) {
-      if (a->jog && (int32_t)(now - a->jog_expire) >= 0 && !a->stop_req) {
-        a->stop_req = 1;                                /* dead-man released */
-        a->evt_deadman = 1;
-      }
-      if ((int32_t)(now - a->t_deadline) >= 0) {         /* should never happen */
-        LENS_Halt((LensAxis_t)i);
-        a->evt = EVT_TIMEOUT;
-        axis_fault(i, F_TIMEOUT);
-      }
-    }
-
-    uint8_t evt = a->evt;
-    if (evt == EVT_NONE || a->running) continue;
-    a->evt = EVT_NONE;
-    if (evt == EVT_STOP && a->evt_deadman) evt = EVT_DEADMAN;
-    a->evt_deadman = 0;
-
-    bool stalled = false;
-    if (evt == EVT_DRVERR) {
-      stalled = classify_diag(i);
-      if (!stalled) continue;                           /* fault already raised */
-      evt = EVT_STALL;
-    }
-
-    if (a->state == AX_HOMING) { home_step(i, evt, stalled); continue; }
-
-    if (stalled) {                                      /* steps were lost */
-      a->pend_valid = 0;
-      if (s_evt_fn) s_evt_fn((LensAxis_t)i, a->pos, s_evt_name[EVT_STALL]);
-      axis_unref(i, "unhomed");
-      continue;
-    }
-    if (a->pend_valid && evt == EVT_STOP) {             /* queued move: go now */
-      a->pend_valid = 0;
-      int32_t t = a->pend_target;
-      if (t != a->pos && gate(a, true) == E_OK) {
-        axis_rates(a);
-        axis_start(a, t > a->pos ? 1 : -1, false, t);
-        continue;
-      }
-      evt = EVT_DONE;
-    }
-    if (i == LENS_ZOOM) trk_focus_to(a->pos);
-    if (s_evt_fn) s_evt_fn((LensAxis_t)i, a->pos, s_evt_name[evt]);
-  }
-
-  health_poll();
-}
-
-/* ============================================================ init ======= */
-static void axis_timer_init(Axis_t *a, IRQn_Type irq)
+static void timer_init(Axis_t *a)
 {
   TIM_OC_InitTypeDef oc = {0};
   oc.OCMode = TIM_OCMODE_PWM2;
   oc.Pulse = 500;
   oc.OCPolarity = TIM_OCPOLARITY_HIGH;
   oc.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  oc.OCFastMode = TIM_OCFAST_DISABLE;
   oc.OCIdleState = TIM_OCIDLESTATE_RESET;
   oc.OCNIdleState = TIM_OCNIDLESTATE_RESET;
   HAL_TIM_PWM_Stop(a->htim, a->ch);
-  HAL_TIM_PWM_ConfigChannel(a->htim, &oc, a->ch);   /* also sets OCxPE (preload) */
+  HAL_TIM_PWM_ConfigChannel(a->htim, &oc, a->ch);   /* sets OCxPE (preload) */
 
   TIM_TypeDef *T = a->htim->Instance;
   T->CR1 &= ~TIM_CR1_CEN;
@@ -935,283 +275,298 @@ static void axis_timer_init(Axis_t *a, IRQn_Type irq)
   TIM_CCxChannelCmd(T, a->ch, TIM_CCx_ENABLE);
   if (IS_TIM_BREAK_INSTANCE(T)) __HAL_TIM_MOE_ENABLE(a->htim);
   __HAL_TIM_ENABLE_IT(a->htim, TIM_IT_UPDATE);
-  HAL_NVIC_SetPriority(irq, MOTOR_IRQ_PRIO, 0);
-  HAL_NVIC_EnableIRQ(irq);
+  HAL_NVIC_SetPriority(a->irq, MOTOR_IRQ_PRIO, 0);
+  HAL_NVIC_EnableIRQ(a->irq);
 }
 
-static void axis_defaults(Axis_t *a, uint8_t addr)
+/* ============================================================ motion ===== */
+static const char *s_err = "";
+
+static bool can_move(LensAxis_t ax)
 {
-  a->addr = addr;
-  a->mres = DEF_MRES;
-  a->irun = DEF_IRUN; a->ihold = DEF_IHOLD; a->iholddelay = DEF_IHOLDDELAY;
-  a->sg_thr = 0;
-  a->start_pps = DEF_START_PPS; a->max_pps = DEF_MAX_PPS; a->acc_pps2 = DEF_ACC_PPS2;
-  a->min_pos = 0;          /* power-up position = lens initial/zero position */
-  a->max_pos = (int32_t)(DEF_TRAVEL_FS * DEF_MRES);   /* until calibrated */
-  a->travel_known = 0;
-  a->warn = W_TRAVEL;
-  a->home_pps = DEF_HOME_PPS; a->home_max_fs = DEF_HOME_MAX_FS; a->home_backoff_fs = DEF_HOME_BACKOFF_FS;
-  a->home_extra = -1;
-  a->state = AX_UNHOMED;
-  a->pos = 0;
-  axis_rates(a);
-}
-
-/* ============================================================ config ===== */
-/* Calibration survives reset in flash bank 1 sector 62 (0x0C07C000, secure).
-   Sector 63 (0x0C07E000) is FLASH_NSC (secure-gateway veneers) - never touch
-   it. The linker script reserves sector 62 (FLASH = 496 KB). Written only on
-   an explicit "save", only with every axis idle (erase stalls code fetch from
-   bank 1 for a few ms), CRC-checked on load. */
-#define CFG_SECTOR  62u
-#define CFG_MAGIC   0x534E454Cu      /* "LENS" */
-#define CFG_VER     2u
-typedef struct {
-  uint32_t magic, ver, size;
-  struct {
-    uint8_t  addr, irun, ihold, sg_thr;
-    uint16_t mres; uint8_t travel_known, pad;
-    uint32_t start_pps, max_pps, acc_pps2;
-    int32_t  max_pos;
-    uint32_t home_pps, home_max_fs, home_backoff_fs;
-    int32_t  home_extra;
-  } ax[LENS_NAXIS];
-  uint8_t  autohome, trk_follow, pad[2];
-  TrkPt_t  trk[TRK_MAX];
-  uint32_t crc;
-} LensCfg_t;
-
-static uint8_t s_autohome;
-
-static uint32_t crc32(const void *d, size_t n)
-{
-  const uint8_t *p = d; uint32_t c = 0xFFFFFFFFu;
-  while (n--) { c ^= *p++; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u))); }
-  return ~c;
-}
-
-static uint32_t cfg_addr(void)
-{
-  return FLASH_BASE + CFG_SECTOR * FLASH_SECTOR_SIZE;        /* 0x0C07C000 */
-}
-
-static void cfg_fill(LensCfg_t *c)
-{
-  memset(c, 0, sizeof *c);
-  c->magic = CFG_MAGIC; c->ver = CFG_VER; c->size = sizeof *c;
-  for (int i = 0; i < LENS_NAXIS; i++) {
-    const Axis_t *a = &s_ax[i];
-    c->ax[i].addr = a->addr; c->ax[i].irun = a->irun; c->ax[i].ihold = a->ihold; c->ax[i].sg_thr = a->sg_thr;
-    c->ax[i].mres = a->mres; c->ax[i].travel_known = a->travel_known;
-    c->ax[i].start_pps = a->start_pps; c->ax[i].max_pps = a->max_pps; c->ax[i].acc_pps2 = a->acc_pps2;
-    c->ax[i].max_pos = a->max_pos;
-    c->ax[i].home_pps = a->home_pps; c->ax[i].home_max_fs = a->home_max_fs;
-    c->ax[i].home_backoff_fs = a->home_backoff_fs;
-    c->ax[i].home_extra = a->home_extra;
-  }
-  c->autohome = s_autohome; c->trk_follow = s_trk_follow;
-  memcpy(c->trk, s_trk, sizeof s_trk);
-  c->crc = crc32(c, offsetof(LensCfg_t, crc));
-}
-
-static bool cfg_load(void)
-{
-  const LensCfg_t *c = (const LensCfg_t *)cfg_addr();
-  if (c->magic != CFG_MAGIC || c->ver != CFG_VER || c->size != sizeof *c) return false;
-  if (crc32(c, offsetof(LensCfg_t, crc)) != c->crc) return false;
-  for (int i = 0; i < LENS_NAXIS; i++) {
-    Axis_t *a = &s_ax[i];
-    uint16_t m = c->ax[i].mres;
-    if (m != 1 && m != 2 && m != 4 && m != 8 && m != 16 && m != 32 && m != 64) return false;
-    a->addr = c->ax[i].addr & 3u; a->irun = c->ax[i].irun; a->ihold = c->ax[i].ihold;
-    a->sg_thr = c->ax[i].sg_thr; a->mres = m;
-    a->start_pps = c->ax[i].start_pps; a->max_pps = c->ax[i].max_pps; a->acc_pps2 = c->ax[i].acc_pps2;
-    if (a->max_pps > LENS_SLEW_PPS_MAX) a->max_pps = LENS_SLEW_PPS_MAX;
-    if (a->start_pps > LENS_START_PPS_MAX) a->start_pps = LENS_START_PPS_MAX;
-    a->max_pos = c->ax[i].max_pos;
-    a->travel_known = c->ax[i].travel_known;
-    if (a->travel_known) a->warn &= (uint8_t)~W_TRAVEL;
-    a->home_pps = c->ax[i].home_pps; a->home_max_fs = c->ax[i].home_max_fs;
-    a->home_backoff_fs = c->ax[i].home_backoff_fs;
-    a->home_extra = c->ax[i].home_extra;
-    axis_rates(a);
-  }
-  s_autohome = c->autohome; s_trk_follow = c->trk_follow;
-  memcpy(s_trk, c->trk, sizeof s_trk);
+  if (!ax_ok(ax))                { s_err = "no such axis"; return false; }
+  if (s_ax[ax].running)          { s_err = "busy";         return false; }
+  if (!s_ax[ax].configured)      { s_err = "driver not configured (lens init)"; return false; }
   return true;
 }
 
-static const char *cfg_save(void)
-{
-  for (int i = 0; i < LENS_NAXIS; i++) if (s_ax[i].running) return "axis moving";
-  uint32_t wm = FLASH->SECWM1R_CUR;
-  uint32_t sec = CFG_SECTOR;
-  uint32_t st = (wm & FLASH_SECWMR_SECWM_STRT_Msk) >> FLASH_SECWMR_SECWM_STRT_Pos;
-  uint32_t en = (wm & FLASH_SECWMR_SECWM_END_Msk) >> FLASH_SECWMR_SECWM_END_Pos;
-  if (st > sec || en < sec) return "config sector is not in the secure flash area";
+/* Zoom lock (2026-11-17, user: calibrate and control focus only, zoom stays
+   at a fixed step). While locked, zoom move/jog requests are refused; homing
+   is allowed and the axis then returns to the fixed position by itself. */
+#define ZOOM_FIXED_DEFAULT  9599      /* Zoom0 field of view (user, 2026-11-17) */
+static bool    s_zoom_locked = true;
+static int32_t s_zoom_fixed  = ZOOM_FIXED_DEFAULT;
+static char    s_lock_msg[48];
 
-  static LensCfg_t c __attribute__((aligned(16)));
-  cfg_fill(&c);
-  FLASH_EraseInitTypeDef e = { .TypeErase = FLASH_TYPEERASE_SECTORS, .Banks = FLASH_BANK_1,
-                               .Sector = sec, .NbSectors = 1 };
-  uint32_t serr = 0;
-  const char *res = NULL;
-  static char why[96];
-  /* ICACHE caches the flash code region: program/erase with it disabled,
-     invalidate afterwards (RM0481 ICACHE / FLASH programming notes). */
-  bool icache_on = (ICACHE->CR & ICACHE_CR_EN) != 0u;
-  if (icache_on) HAL_ICACHE_Disable();
-  HAL_FLASH_Unlock();
-  if (HAL_FLASHEx_Erase(&e, &serr) != HAL_OK) {
-    snprintf(why, sizeof why, "erase failed (err 0x%lX)", (unsigned long)HAL_FLASH_GetError()); res = why;
-  }
-  for (uint32_t off = 0; !res && off < sizeof c; off += 16u)
-    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, cfg_addr() + off, (uint32_t)((uint8_t *)&c + off)) != HAL_OK) {
-      snprintf(why, sizeof why, "program failed at 0x%08lX (err 0x%lX)", (unsigned long)(cfg_addr() + off),
-               (unsigned long)HAL_FLASH_GetError());
-      res = why;
-    }
-  uint32_t sr = FLASH->SECSR, cr = FLASH->SECCR;
-  HAL_FLASH_Lock();
-  if (icache_on) { HAL_ICACHE_Invalidate(); HAL_ICACHE_Enable(); }
-  if (!res) {
-    const uint8_t *f = (const uint8_t *)cfg_addr(), *r = (const uint8_t *)&c;
-    for (uint32_t k = 0; k < sizeof c; k++) if (f[k] != r[k]) {
-      snprintf(why, sizeof why, "verify failed at 0x%08lX (SECSR 0x%08lX SECCR 0x%08lX)",
-               (unsigned long)(cfg_addr() + k), (unsigned long)sr, (unsigned long)cr);
-      res = why; break;
-    }
-  }
-  return res;
+/* Focus calibration, tools/focus_cal.py, 2026-11-17 (zoom 9599, day mode,
+   centre-1/3 Sobel sharpness, tools/focus_cal/results.json):
+   - sharpness peaks at the homed 0 (887, flat top: 0/100/200 = 887/881/868)
+     and falls steadily upward; home -> 0 five times: within 0.6 %.
+   - the image stops changing above ~34000 (far end, or just full blur -
+     not confirmed by eye); travel = 34000 - 1600.
+   - the homed 0 is a repeatable stall point, not the hard stop: the stop is
+     ~800..1600 lower, and moves below 0 lose steps. Keep the limit at 0. */
+#define FOCUS_BEST_DEFAULT    0       /* best focus for the installed scene, usteps */
+#define FOCUS_TRAVEL_DEFAULT  32400   /* forward soft limit after homing */
+#define FOCUS_BACKLASH_PRE 1000       /* moves from above go this far below, then up */
+static int32_t s_focus_best = FOCUS_BEST_DEFAULT;
+
+/* Second leg of a move that must finish from below. */
+static bool    s_pend_valid[LENS_NAXIS];
+static int32_t s_pend[LENS_NAXIS];
+
+/* Boot sequence: 1 = homing both, 2 = moving to zoom fixed / focus best, 0 = done. */
+static uint8_t s_boot;
+
+static bool zoom_lock_check(LensAxis_t ax)
+{
+  if (ax != LENS_ZOOM || !s_zoom_locked) return true;
+  snprintf(s_lock_msg, sizeof s_lock_msg, "zoom locked at %ld (lens z unlock)", (long)s_zoom_fixed);
+  s_err = s_lock_msg;
+  return false;
 }
 
-static void scan_report(LensPrintFn print)
+static bool boot_check(void)
 {
-  for (uint8_t addr = 0; addr < 4u; addr++) {
-    uint32_t io;
-    if (tmc_read(addr, R_IOIN, &io)) {
-      const char *who = "?";
-      for (int i = 0; i < LENS_NAXIS; i++) if (s_ax[i].addr == addr) who = LENS_AxisName[i];
-      snprintf(s_buf, sizeof s_buf, "[LENS] TMC2300 @%u answers: IOIN=0x%08lX ver=0x%02lX (mapped: %s)\r\n",
-               addr, (unsigned long)io, (unsigned long)(io >> 24), who);
-    } else {
-      snprintf(s_buf, sizeof s_buf, "[LENS] TMC2300 @%u: no reply\r\n", addr);
-    }
-    print(s_buf);
-  }
+  if (s_boot) { s_err = "busy: homing at boot"; return false; }
+  return true;
 }
 
-static void config_report(LensPrintFn print)
+static bool move_to(LensAxis_t ax, int32_t pos)
+{
+  if (!can_move(ax)) return false;
+  Axis_t *a = &s_ax[ax];
+  if (s_pend_valid[ax]) { s_err = "busy"; return false; }
+  if (a->limits_on && (pos < a->min_pos || pos > a->max_pos)) { s_err = "outside soft limits"; return false; }
+  if (pos == a->pos) { a->target = pos; a->evt = EVT_DONE; return true; }
+  a->nolimit = false;
+  int32_t first = pos;
+  if (ax == LENS_FOCUS && pos < a->pos) {          /* backlash: finish upward */
+    first = pos - FOCUS_BACKLASH_PRE;
+    if (a->limits_on && first < a->min_pos) first = a->min_pos;
+    if (first < pos) { s_pend[ax] = pos; s_pend_valid[ax] = true; }
+    else first = pos;
+  }
+  axis_start(a, first > a->pos ? 1 : 0, false, first, 0);
+  return true;
+}
+
+bool LENS_MoveTo(LensAxis_t ax, int32_t pos)
+{
+  return boot_check() && zoom_lock_check(ax) && move_to(ax, pos);
+}
+
+bool LENS_MoveRel(LensAxis_t ax, int32_t delta)
+{
+  if (!ax_ok(ax)) { s_err = "no such axis"; return false; }
+  int32_t goal = s_pend_valid[ax] ? s_pend[ax] : s_ax[ax].pos;
+  return LENS_MoveTo(ax, goal + delta);
+}
+
+static bool jog(LensAxis_t ax, int dir, uint32_t pps, uint32_t max_ms)
+{
+  if (!boot_check() || !zoom_lock_check(ax) || !can_move(ax)) return false;
+  if (s_pend_valid[ax]) { s_err = "busy"; return false; }
+  Axis_t *a = &s_ax[ax];
+  if (pps == 0u || pps > a->max_pps) pps = a->max_pps;
+  /* already at the limit in this direction: the first STEP would overshoot it */
+  if (a->limits_on && (dir > 0 ? a->pos >= a->max_pos : a->pos <= a->min_pos)) {
+    s_err = "already at the soft limit"; return false;
+  }
+  a->nolimit = false;
+  a->jog_until = max_ms ? HAL_GetTick() + max_ms : 0u;
+  if (a->jog_until == 0u && max_ms) a->jog_until = 1u;
+  axis_start(a, dir, true, 0, pps);
+  return true;
+}
+
+bool LENS_Jog(LensAxis_t ax, int dir, uint32_t pps) { return jog(ax, dir, pps, JOG_MAX_MS); }
+
+void LENS_Stop(LensAxis_t ax)
+{
+  if ((unsigned)ax >= LENS_NAXIS) return;
+  s_pend_valid[ax] = false;
+  if (s_ax[ax].running) s_ax[ax].stop_req = true;
+}
+
+void LENS_Halt(LensAxis_t ax)
+{
+  if ((unsigned)ax >= LENS_NAXIS) return;
+  Axis_t *a = &s_ax[ax];
+  s_pend_valid[ax] = false;
+  HAL_NVIC_DisableIRQ(a->irq);
+  if (a->running) axis_finish(a, EVT_STOP);
+  HAL_NVIC_EnableIRQ(a->irq);
+}
+
+bool    LENS_IsMoving(LensAxis_t ax) { return (unsigned)ax < LENS_NAXIS && (s_ax[ax].running || s_pend_valid[ax]); }
+int32_t LENS_GetPos(LensAxis_t ax)   { return (unsigned)ax < LENS_NAXIS ? s_ax[ax].pos : 0; }
+void    LENS_SetEventHandler(LensEventFn fn) { s_evt_fn = fn; }
+
+static void set_reference(Axis_t *a)
+{
+  a->pos = 0;
+  a->referenced = true;
+  a->limits_on = true;
+  a->min_pos = 0;
+  a->max_pos = a->travel > 0 ? a->travel : POS_FAR;
+}
+
+static bool zero(LensAxis_t ax)
+{
+  if (!boot_check()) return false;
+  if (!ax_ok(ax) || LENS_IsMoving(ax)) { s_err = "busy"; return false; }
+  set_reference(&s_ax[ax]);
+  return true;
+}
+
+/* Blind home: run home_fs full steps in reverse at home_pps, ignoring the
+   soft limits, into the reverse hard stop (a PM stepper at 40 ohm / 3.3 V
+   just skips there), then call that position 0. */
+static bool home(LensAxis_t ax)
+{
+  if (!can_move(ax)) return false;
+  if (s_pend_valid[ax]) { s_err = "busy"; return false; }
+  Axis_t *a = &s_ax[ax];
+  a->nolimit = true;
+  a->homing = true;
+  a->jog_until = 0;
+  uint32_t save = a->start_pps;
+  a->start_pps = a->home_pps;          /* constant speed: no ramp into the stop */
+  axis_start(a, 0, false, a->pos - (int32_t)(a->home_fs * MRES), a->home_pps);
+  a->start_pps = save;
+  return true;
+}
+
+static bool home_cmd(LensAxis_t ax) { return boot_check() && home(ax); }
+
+static void emit(int i, const char *reason)
+{
+  if (s_evt_fn) s_evt_fn((LensAxis_t)i, s_ax[i].pos, reason);
+}
+
+static bool all_idle(void)
+{
+  for (int i = LENS_ZOOM; i <= LENS_FOCUS; i++)
+    if (s_ax[i].running || s_ax[i].homing || s_pend_valid[i] || s_ax[i].evt != EVT_NONE) return false;
+  return true;
+}
+
+static void boot_task(void)
+{
+  if (!s_boot || !all_idle()) return;
+  if (s_boot == 1) {
+    s_boot = 2;
+    if (s_ax[LENS_ZOOM].referenced && s_ax[LENS_FOCUS].referenced) {
+      move_to(LENS_ZOOM, s_zoom_fixed);
+      move_to(LENS_FOCUS, s_focus_best);
+    }
+    return;
+  }
+  s_boot = 0;
+  emit(LENS_FOCUS, "ready");           /* main.c turns this into READY on the SoC link */
+}
+
+void LENS_Task(void)
 {
   for (int i = 0; i < LENS_NAXIS; i++) {
     Axis_t *a = &s_ax[i];
-    axis_configure(a);
-    if (a->present) {                      /* refresh the live VS warning */
-      uint32_t g;
-      if (tmc_read(a->addr, R_GSTAT, &g)) { if (g & 4u) a->warn |= W_UV; else a->warn &= (uint8_t)~W_UV; }
-      axis_rates(a);
+    if (a->running && a->jog && a->jog_until && (int32_t)(HAL_GetTick() - a->jog_until) >= 0) {
+      a->jog_until = 0;
+      a->timed_out = true;
+      a->stop_req = true;
     }
-    snprintf(s_buf, sizeof s_buf, "[LENS] %-5s %s@%u: %s\r\n", LENS_AxisName[i], a->drv, a->addr,
-             !a->present ? "NO REPLY - driver not configured (check M1/M2_PWR, AD0/AD1)" :
-             a->configured ? "configured" : "replied but config NOT confirmed");
-    print(s_buf);
-    uint32_t gs;
-    if (a->present && tmc_read(a->addr, R_GSTAT, &gs) && (gs & 4u)) {
-      snprintf(s_buf, sizeof s_buf, "[LENS] %-5s %s: WARNING VS < 3.5 V (GSTAT.u3v5) - motor rated 4 V, low torque\r\n",
-               LENS_AxisName[i], a->drv);
-      print(s_buf);
+    uint8_t e = a->evt;
+    if (e == EVT_NONE || a->running) continue;
+    a->evt = EVT_NONE;
+    if (a->homing) {
+      a->homing = false;
+      a->nolimit = false;
+      if (e == EVT_DONE) {
+        set_reference(a); emit(i, "homed");
+        if (i == LENS_ZOOM && s_zoom_locked && !s_boot) move_to(LENS_ZOOM, s_zoom_fixed);
+      }
+      else emit(i, "home-abort");
+      continue;
     }
+    if (s_pend_valid[i]) {             /* first leg done: now come up to the goal */
+      s_pend_valid[i] = false;
+      if (e == EVT_DONE && move_to((LensAxis_t)i, s_pend[i])) continue;
+    }
+    emit(i, a->timed_out ? "timeout" : e == EVT_DONE ? "done" : e == EVT_STOP ? "stop" : "limit");
+    a->timed_out = false;
   }
+  boot_task();
 }
+
+/* ============================================================== init ===== */
+static void axis_hw(Axis_t *a, const char *drv, TIM_HandleTypeDef *h, uint32_t ch, volatile uint32_t *ccr,
+                    IRQn_Type irq, GPIO_TypeDef *dp, uint16_t dpin, GPIO_TypeDef *ep, uint16_t epin, uint8_t addr)
+{
+  a->drv = drv; a->htim = h; a->ch = ch; a->ccr = ccr; a->irq = irq;
+  a->dir_port = dp; a->dir_pin = dpin; a->en_port = ep; a->en_pin = epin; a->addr = addr;
+  a->irun = 31; a->ihold = 0;
+  a->start_pps = 200; a->max_pps = 300; a->acc_pps2 = 600;
+  a->home_pps = 300; a->home_fs = 1200;
+  a->travel = 0;
+  a->min_pos = 0; a->max_pos = POS_FAR;
+}
+
+static void print_status(LensPrintFn print);
 
 void LENS_Init(LensPrintFn print)
 {
   GPIO_InitTypeDef g = {0};
-
-  /* PA10 (USART1_RX) must not fight the single-wire PA9 bus */
   g.Pin = GPIO_PIN_10; g.Mode = GPIO_MODE_ANALOG; g.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &g);
-  g.Mode = GPIO_MODE_INPUT;
-  g.Pin = ZOOM_DIAG_Pin;  HAL_GPIO_Init(ZOOM_DIAG_GPIO_Port, &g);
-  g.Pin = FOCUS_DIAG_Pin; HAL_GPIO_Init(FOCUS_DIAG_GPIO_Port, &g);
-  g.Pin = IRIS_DIAG_Pin;  HAL_GPIO_Init(IRIS_DIAG_GPIO_Port, &g);
+  HAL_GPIO_Init(GPIOA, &g);            /* PA10 (USART1_RX) must not load the PA9 bus */
 
-  /* z = driver U1 (schematic ZOOM), f = driver U2 (schematic FOCUS); which
-     logical axis each drives is set by LENS_SWAP_ZOOM_FOCUS (lens_ctrl.h). */
-  Axis_t *z = &s_ax[LENS_AXIS_U1], *f = &s_ax[LENS_AXIS_U2], *ir = &s_ax[LENS_IRIS];
   memset(s_ax, 0, sizeof s_ax);
-  z->drv = "U1"; f->drv = "U2"; ir->drv = "U5";
+  Axis_t *u1 = &s_ax[LENS_AXIS_U1], *u2 = &s_ax[LENS_AXIS_U2], *u5 = &s_ax[LENS_IRIS];
+  axis_hw(u1, "U1", &htim3, TIM_CHANNEL_2, &TIM3->CCR2, TIM3_IRQn,
+          ZOOM_DIR_GPIO_Port, ZOOM_DIR_Pin, ZOOM_EN_GPIO_Port, ZOOM_EN_Pin, 0);
+  axis_hw(u2, "U2", &htim8, TIM_CHANNEL_2, &TIM8->CCR2, TIM8_UP_IRQn,
+          FOCUS_DIR_GPIO_Port, FOCUS_DIR_Pin, FOCUS_EN_GPIO_Port, FOCUS_EN_Pin, 2);
+  axis_hw(u5, "U5", &htim4, TIM_CHANNEL_1, &TIM4->CCR1, TIM4_IRQn,
+          IRIS_DIR_GPIO_Port, IRIS_DIR_Pin, IRIS_EN_GPIO_Port, IRIS_EN_Pin, 3);
+  u1->fitted = u2->fitted = true;      /* iris is fixed: U5 has no motor */
 
-  z->htim = &htim3; z->ch = TIM_CHANNEL_2; z->ccr = &TIM3->CCR2;
-  z->dir_port = ZOOM_DIR_GPIO_Port; z->dir_pin = ZOOM_DIR_Pin;
-  z->en_port = ZOOM_EN_GPIO_Port;   z->en_pin = ZOOM_EN_Pin;
-  z->diag_port = ZOOM_DIAG_GPIO_Port; z->diag_pin = ZOOM_DIAG_Pin;
+  /* Values tuned on the bench before the rewrite (2026-11-17). */
+  Axis_t *zm = &s_ax[LENS_ZOOM], *fm = &s_ax[LENS_FOCUS];
+  zm->start_pps = 200; zm->max_pps = 300; zm->acc_pps2 = 600;
+  zm->home_pps = 300;  zm->home_fs = 1130; zm->travel = 16900;
+  fm->start_pps = 200; fm->max_pps = 300; fm->acc_pps2 = 1000;  /* 3.3 V: slow, no lost steps */
+  fm->home_pps = 300;  fm->home_fs = 4000; fm->travel = FOCUS_TRAVEL_DEFAULT;
 
-  f->htim = &htim8; f->ch = TIM_CHANNEL_2; f->ccr = &TIM8->CCR2;
-  f->dir_port = FOCUS_DIR_GPIO_Port; f->dir_pin = FOCUS_DIR_Pin;
-  f->en_port = FOCUS_EN_GPIO_Port;   f->en_pin = FOCUS_EN_Pin;
-  f->diag_port = FOCUS_DIAG_GPIO_Port; f->diag_pin = FOCUS_DIAG_Pin;
-
-  ir->htim = &htim4; ir->ch = TIM_CHANNEL_1; ir->ccr = &TIM4->CCR1;
-  ir->dir_port = IRIS_DIR_GPIO_Port; ir->dir_pin = IRIS_DIR_Pin;
-  ir->en_port = IRIS_EN_GPIO_Port;   ir->en_pin = IRIS_EN_Pin;
-  ir->diag_port = IRIS_DIAG_GPIO_Port; ir->diag_pin = IRIS_DIAG_Pin;
-
-  axis_defaults(z, 0);    /* schematic: U1 ADDR 00 */
-  axis_defaults(f, 1);    /*            U2 ADDR 01 */
-  axis_defaults(ir, 2);   /*            iris U5 ADDR 10  */
-  bool cfg_ok = cfg_load();
-  if (!cfg_ok) {
-    Axis_t *zc = &s_ax[LENS_ZOOM];
-    zc->max_pos = ZOOM_CAL_TRAVEL;
-    zc->travel_known = 1;
-    zc->warn &= (uint8_t)~W_TRAVEL;
-    zc->home_pps = ZOOM_CAL_HOME_PPS;
-    zc->home_max_fs = ZOOM_CAL_HOME_MAX_FS;
-    zc->home_backoff_fs = ZOOM_CAL_BACKOFF_FS;
-    zc->home_extra = ZOOM_CAL_HOME_EXTRA;
-  }
-
-  for (int i = 0; i < LENS_NAXIS; i++)
-    HAL_GPIO_WritePin(s_ax[i].en_port, s_ax[i].en_pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(u1->en_port, u1->en_pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(u2->en_port, u2->en_pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(u5->en_port, u5->en_pin, GPIO_PIN_RESET);
   HAL_Delay(50);
 
-  uint8_t dummy = 0;                   /* first byte syncs the TMC auto-baud */
+  uint8_t sync = 0;                    /* first byte lets the TMC auto-baud lock */
   HAL_UART_Abort(&huart1);
   HAL_HalfDuplex_EnableTransmitter(&huart1);
-  HAL_UART_Transmit(&huart1, &dummy, 1, 10);
+  HAL_UART_Transmit(&huart1, &sync, 1, 10);
   HAL_Delay(2);
 
-  axis_timer_init(z, TIM3_IRQn);
-  axis_timer_init(f, TIM8_UP_IRQn);
-  axis_timer_init(ir, TIM4_IRQn);
+  drv_config(u1);
+  drv_config(u2);
+  timer_init(u1);
+  timer_init(u2);
+  timer_init(u5);
 
-  print("\r\n[LENS] NV-0622IR lens - guarded motion control (lens help)\r\n");
-  print(cfg_ok ? "[LENS] calibration loaded from flash\r\n"
-               : "[LENS] no saved calibration - built-in zoom calibration (0..16900), focus uncalibrated\r\n");
-  scan_report(print);
-  config_report(print);
-  if (s_autohome) {
-    for (int i = 0; i < LENS_NAXIS; i++) {
-      if (i == LENS_IRIS || !s_ax[i].configured) continue;   /* lens has no iris motor */
-      LensErr_t e = LENS_Home((LensAxis_t)i);
-      snprintf(s_buf, sizeof s_buf, "[LENS] autohome %s: %s\r\n", LENS_AxisName[i],
-               e == E_OK ? "started" : s_err_name[e]);
-      print(s_buf);
-    }
+  print("\r\n[LENS] lens control (rewrite 2026-11-17) - \"lens help\"\r\n");
+  print_status(print);
+
+  /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
+  if (home(LENS_ZOOM) && home(LENS_FOCUS)) {
+    s_boot = 1;
+    print("[LENS] homing both axes (~15 s), then zoom fixed / focus best\r\n");
+  } else {
+    print("[LENS] boot homing not started: driver not configured\r\n");
   }
 }
 
-/* ============================================================ console ==== */
-static int parse_axis(const char *s)
-{
-  if (!s) return -1;
-  if (!strcmp(s, "z") || !strcmp(s, "zoom"))  return LENS_ZOOM;
-  if (!strcmp(s, "f") || !strcmp(s, "focus")) return LENS_FOCUS;
-  if (!strcmp(s, "i") || !strcmp(s, "iris"))  return LENS_IRIS;
-  return -1;
-}
-
+/* =========================================================== console ===== */
 static bool parse_long(const char *s, long *out)
 {
   if (!s || !*s) return false;
@@ -1222,628 +577,293 @@ static bool parse_long(const char *s, long *out)
   return true;
 }
 
-static void flags_str(char *o, size_t n, unsigned v, const char *const *names, unsigned cnt)
+static int parse_axis(const char *s)
 {
-  o[0] = 0;
-  if (!v) { snprintf(o, n, "-"); return; }
-  for (unsigned b = 0; b < cnt; b++) if (v & (1u << b)) {
-    size_t l = strlen(o);
-    snprintf(o + l, n - l, "%s%s", l ? "," : "", names[b]);
+  if (!strcmp(s, "z") || !strcmp(s, "zoom"))  return LENS_ZOOM;
+  if (!strcmp(s, "f") || !strcmp(s, "focus")) return LENS_FOCUS;
+  if (!strcmp(s, "u1")) return LENS_AXIS_U1;
+  if (!strcmp(s, "u2")) return LENS_AXIS_U2;
+  return -1;
+}
+
+static void print_axis(int i, LensPrintFn print)
+{
+  Axis_t *a = &s_ax[i];
+  uint32_t gstat = 0, drv = 0;
+  bool rd = a->present && tmc_read(a->addr, R_GSTAT, &gstat) && tmc_read(a->addr, R_DRV_STATUS, &drv);
+  char lim[32];
+  if (a->limits_on) snprintf(lim, sizeof lim, "%ld..%ld", (long)a->min_pos,
+                             a->max_pos >= POS_FAR ? -1L : (long)a->max_pos);
+  else snprintf(lim, sizeof lim, "off");
+  snprintf(s_buf, sizeof s_buf, "%-5s %s@%u %s pos %ld (%ld fs) %s  %s  lim %s\r\n",
+           LENS_AxisName[i], a->drv, a->addr,
+           !a->present ? "NO-UART" : a->configured ? "ok" : "NOCFG",
+           (long)a->pos, (long)(a->pos / MRES), LENS_IsMoving((LensAxis_t)i) ? (a->homing ? "HOMING" : "MOVING") : "idle",
+           a->referenced ? "ref" : "unref", lim);
+  print(s_buf);
+  if (i == LENS_ZOOM) {
+    snprintf(s_buf, sizeof s_buf, "      %s %ld\r\n", s_zoom_locked ? "LOCKED at" : "unlocked, fixed pos", (long)s_zoom_fixed);
+    print(s_buf);
+  }
+  snprintf(s_buf, sizeof s_buf, "      speed %lu/%lu pps acc %lu  irun %u ihold %u  home %lu pps %lu fs  travel %ld\r\n",
+           (unsigned long)a->start_pps, (unsigned long)a->max_pps, (unsigned long)a->acc_pps2,
+           a->irun, a->ihold, (unsigned long)a->home_pps, (unsigned long)a->home_fs, (long)a->travel);
+  print(s_buf);
+  if (rd) {
+    snprintf(s_buf, sizeof s_buf, "      GSTAT %02lx%s%s%s  DRV_STATUS %08lx%s%s%s%s\r\n",
+             (unsigned long)gstat, (gstat & 1u) ? " reset" : "", (gstat & 2u) ? " drv_err" : "",
+             (gstat & 4u) ? " uv(VS<3.5V)" : "", (unsigned long)drv,
+             (drv & 0x3u) ? " OT" : "", (drv & 0x3Cu) ? " SHORT" : "",
+             (drv & 0xC0u) ? " openload" : "", (drv & (1u << 31)) ? " standstill" : "");
+    print(s_buf);
   }
 }
 
 static void print_status(LensPrintFn print)
 {
-  char fs[48], ws[48];
-  for (int i = 0; i < LENS_NAXIS; i++) {
-    Axis_t *a = &s_ax[i];
-    flags_str(fs, sizeof fs, a->fault, s_fault_name, 6);
-    flags_str(ws, sizeof ws, a->warn, s_warn_name, 5);
-    snprintf(s_buf, sizeof s_buf,
-             "%-5s %-7s pos %ld (%ld fs) %s  lim %ld..%ld%s  fault %s  warn %s\r\n",
-             LENS_AxisName[i], s_state_name[a->state], (long)a->pos, (long)(a->pos / (int32_t)a->mres),
-             a->running ? (a->jog ? "JOG" : "MOVING") : "idle",
-             (long)a->min_pos, (long)a->max_pos, a->travel_known ? "" : "(default)", fs, ws);
-    print(s_buf);
-    snprintf(s_buf, sizeof s_buf,
-             "      %s@%u %s%s mres %u irun %u ihold %u | speed %lu/%lu pps acc %lu | home %lu pps max %lu fs off %lu fs extra %ld | heat %lus\r\n",
-             a->drv, a->addr, a->configured ? "cfg" : (a->present ? "NOCFG" : "ABSENT"),
-             a->allow_nocfg ? " TESTMODE" : "", a->mres, a->irun, a->ihold,
-             (unsigned long)a->start_pps, (unsigned long)a->max_pps, (unsigned long)a->acc_pps2,
-             (unsigned long)a->home_pps, (unsigned long)a->home_max_fs, (unsigned long)a->home_backoff_fs,
-             (long)a->home_extra, (unsigned long)(a->heat_ms / 1000u));
-    print(s_buf);
-  }
-  snprintf(s_buf, sizeof s_buf, "autohome %s, stall detection %s/%s/%s (sgthrs)\r\n", s_autohome ? "on" : "off",
-           s_ax[0].sg_thr ? "on" : "off", s_ax[1].sg_thr ? "on" : "off", s_ax[2].sg_thr ? "on" : "off");
-  print(s_buf);
-}
-
-static void dump_axis(Axis_t *a, LensPrintFn print)
-{
-  static const struct { uint8_t r; const char *n; } regs[] = {
-    {R_GCONF, "GCONF"}, {R_GSTAT, "GSTAT"}, {R_IFCNT, "IFCNT"}, {R_IOIN, "IOIN"},
-    {R_TSTEP, "TSTEP"}, {R_SG_VALUE, "SG_VALUE"}, {R_CHOPCONF, "CHOPCONF"},
-    {R_DRV_STATUS, "DRV_STATUS"}, {R_PWMCONF, "PWMCONF"}, {R_PWM_SCALE, "PWM_SCALE"},
-    {R_PWM_AUTO, "PWM_AUTO"},
-  };
-  snprintf(s_buf, sizeof s_buf, "TMC2300 @%u (write-only regs IHOLD_IRUN/TCOOLTHRS/SGTHRS not readable)\r\n", a->addr);
-  print(s_buf);
-  for (unsigned i = 0; i < sizeof regs / sizeof regs[0]; i++) {
-    uint32_t v;
-    if (tmc_read(a->addr, regs[i].r, &v))
-      snprintf(s_buf, sizeof s_buf, "  %-10s 0x%02X = 0x%08lX\r\n", regs[i].n, regs[i].r, (unsigned long)v);
-    else
-      snprintf(s_buf, sizeof s_buf, "  %-10s 0x%02X : no reply / CRC error\r\n", regs[i].n, regs[i].r);
-    print(s_buf);
-  }
-}
-
-static int trk_col(const char *t)
-{
-  for (int c = 0; c < TRK_COLS; c++) if (!strcmp(t, s_col_name[c])) return c;
-  if (!strcmp(t, "0")) return 0;
-  return -1;
-}
-
-static void trk_print_point(int i, LensPrintFn print, bool as_cmd)
-{
-  const TrkPt_t *p = &s_trk[i];
-  char v[TRK_COLS][12];
-  for (int c = 0; c < TRK_COLS; c++) {
-    if (p->focus[c] == TRK_UNSET) strcpy(v[c], as_cmd ? "x" : "-");
-    else snprintf(v[c], sizeof v[c], "%ld", (long)p->focus[c]);
-  }
-  if (as_cmd)
-    snprintf(s_buf, sizeof s_buf, "lens track set %d %ld %s %s %s %s\r\n", i, (long)p->zoom, v[0], v[1], v[2], v[3]);
-  else
-    snprintf(s_buf, sizeof s_buf, "  %2d  zoom %8ld   focus inf %8s  3m %8s  1m %8s  0.3m %8s\r\n",
-             i, (long)p->zoom, v[0], v[1], v[2], v[3]);
-  print(s_buf);
-}
-
-static bool parse_focus(const char *t, int32_t *out)
-{
-  long v;
-  if (!strcmp(t, "x") || !strcmp(t, "-")) { *out = TRK_UNSET; return true; }
-  if (!parse_long(t, &v)) return false;
-  *out = (int32_t)v;
-  return true;
-}
-
-static void cli_track(char **tok, int nt, LensPrintFn print)
-{
-  const char *op = nt > 0 ? tok[0] : "show";
-  long i = 0, v = 0;
-
-  if (!strcmp(op, "show") || !strcmp(op, "dump")) {
-    bool as_cmd = !strcmp(op, "dump");
-    uint8_t idx[TRK_MAX];
-    int n = trk_sorted(idx);
-    if (!as_cmd) {
-      snprintf(s_buf, sizeof s_buf, "tracking: %d point(s) usable, follow %s, distance %s",
-               n, s_trk_follow ? "ON" : "off", s_trk_dpt <= 0.0f ? "inf" : "");
-      print(s_buf);
-      if (s_trk_dpt > 0.0f) {
-        snprintf(s_buf, sizeof s_buf, "%ld mm", lroundf(1000.0f / s_trk_dpt)); print(s_buf);
-      }
-      print("\r\n");
-    } else {
-      print("lens track clear\r\n");
-    }
-    for (int k = 0; k < TRK_MAX; k++) if (s_trk[k].used) trk_print_point(k, print, as_cmd);
-    if (!as_cmd && n > 0) {
-      int32_t f;
-      if (trk_focus(s_ax[LENS_ZOOM].pos, s_trk_dpt, &f)) {
-        snprintf(s_buf, sizeof s_buf, "  at zoom %ld -> focus %ld (focus now %ld)\r\n",
-                 (long)s_ax[LENS_ZOOM].pos, (long)f, (long)s_ax[LENS_FOCUS].pos);
-        print(s_buf);
-      }
-    }
-    return;
-  }
-  if (!strcmp(op, "clear")) {
-    memset(s_trk, 0, sizeof s_trk); print("OK table cleared\r\n"); return;
-  }
-  if (!strcmp(op, "set") && nt >= 3 && parse_long(tok[1], &i) && i >= 0 && i < TRK_MAX &&
-      parse_long(tok[2], &v)) {
-    TrkPt_t p = { 1, (int32_t)v, { TRK_UNSET, TRK_UNSET, TRK_UNSET, TRK_UNSET } };
-    for (int c = 0; c < TRK_COLS && 3 + c < nt; c++)
-      if (!parse_focus(tok[3 + c], &p.focus[c])) { print("ERROR: focus value or x\r\n"); return; }
-    s_trk[i] = p;
-    trk_print_point((int)i, print, false); return;
-  }
-  if (!strcmp(op, "cap") && nt >= 3 && parse_long(tok[1], &i) && i >= 0 && i < TRK_MAX) {
-    int c = trk_col(tok[2]);
-    if (c < 0) { print("ERROR: column inf|3m|1m|0.3m\r\n"); return; }
-    if (LENS_IsMoving(LENS_ZOOM) || LENS_IsMoving(LENS_FOCUS)) { print("ERROR: moving\r\n"); return; }
-    TrkPt_t *p = &s_trk[i];
-    if (!p->used || p->zoom != s_ax[LENS_ZOOM].pos) {
-      if (p->used) print("note: zoom differs from stored point - other columns cleared\r\n");
-      p->used = 1; p->zoom = s_ax[LENS_ZOOM].pos;
-      for (int k = 0; k < TRK_COLS; k++) p->focus[k] = TRK_UNSET;
-    }
-    p->focus[c] = s_ax[LENS_FOCUS].pos;
-    trk_print_point((int)i, print, false); return;
-  }
-  if (!strcmp(op, "del") && nt >= 2 && parse_long(tok[1], &i) && i >= 0 && i < TRK_MAX) {
-    s_trk[i].used = 0; print("OK\r\n"); return;
-  }
-  if (!strcmp(op, "follow") && nt >= 2) {
-    s_trk_follow = !strcmp(tok[1], "on");
-    if (s_trk_follow) trk_capture();
-    snprintf(s_buf, sizeof s_buf, "OK follow %s\r\n", s_trk_follow ? "on" : "off");
-    print(s_buf); return;
-  }
-  if (!strcmp(op, "dist") && nt >= 2) {
-    long mm = 0;
-    if (strcmp(tok[1], "inf") && (!parse_long(tok[1], &mm) || mm < 0)) { print("ERROR: mm|inf\r\n"); return; }
-    if (mm > 0 && mm < 100) mm = 100;
-    uint8_t idx[TRK_MAX];
-    if (trk_sorted(idx) == 0) { print("ERROR: table empty\r\n"); return; }
-    trk_set_distance((uint32_t)mm);
-    snprintf(s_buf, sizeof s_buf, "OK distance %s%ld, focus -> %ld\r\n", mm ? "" : "inf ", mm,
-             (long)axis_goal(&s_ax[LENS_FOCUS]));
-    print(s_buf); return;
-  }
-  if (!strcmp(op, "goto") && nt >= 2 && parse_long(tok[1], &v)) {
-    long mm = -1;
-    if (nt >= 3 && strcmp(tok[2], "inf") && (!parse_long(tok[2], &mm) || mm < 0)) { print("ERROR: mm\r\n"); return; }
-    if (nt >= 3) s_trk_dpt = (mm > 0) ? 1000.0f / (float)(mm < 100 ? 100 : mm) : 0.0f;
-    else trk_capture();
-    uint8_t f = s_trk_follow;
-    s_trk_follow = 1;                  /* one-shot follow for this move */
-    bool ok = move_to_raw(LENS_ZOOM, (int32_t)v);
-    if (ok) trk_focus_to((int32_t)v);
-    s_trk_follow = f;
-    snprintf(s_buf, sizeof s_buf, "%s zoom -> %ld, focus -> %ld\r\n", ok ? "OK" : "REJECTED", v,
-             (long)axis_goal(&s_ax[LENS_FOCUS]));
-    print(s_buf); return;
-  }
-  print("ERROR: lens track [show|dump|clear|set|cap|del|follow|dist|goto] - lens help\r\n");
+  print_axis(LENS_ZOOM, print);
+  print_axis(LENS_FOCUS, print);
 }
 
 static void print_help(LensPrintFn print)
 {
-  print("lens commands (<ax> = z|zoom f|focus i|iris; pos in microsteps, speeds in full steps/s):\r\n");
-  print("  lens [status]                   positions, state, driver config\r\n");
-  print("  lens scan | init                probe TMC2300 @0..3 / re-write driver config\r\n");
-  print("  lens <ax> goto <pos>            absolute move (ramped)\r\n");
-  print("  lens <ax> rel <+-steps>         relative move\r\n");
-  print("  lens <ax> jog <1|0> [pps]       run fwd(1)/rev(0) until stop or soft limit\r\n");
-  print("  lens <ax> stop | lens stop      decelerated stop (halt = immediate)\r\n");
-  print("  lens <ax> zero                  current position := 0\r\n");
-  print("  lens <ax> limit <min> <max>     soft limits (max -1 = none)\r\n");
-  print("  lens <ax> speed <start> <max> <acc>  pps, pps, pps^2 (start<=800, max<=1200)\r\n");
-  print("  lens <ax> cur <irun> [ihold]    0..31, IRUN >= 8 (coils limit to ~VS/40)\r\n");
-  print("  lens <ax> mres <1..64>          microsteps per full step (rescales pos)\r\n");
-  print("  lens <ax> addr <0..3>           TMC2300 UART node address\r\n");
-  print("  lens <ax> sg <0..255>           StallGuard threshold, 0 = off\r\n");
-  print("  lens <ax> dump | reg <r> [val]  driver registers\r\n");
-  print("  --- guard rails (docs/lens-control-design.md) ---\r\n");
-  print("  lens home [all] | lens <ax> home  reference against the reverse hard stop\r\n");
-  print("  lens clr [all] | lens <ax> clr  clear faults, re-configure driver (-> UNHOMED)\r\n");
-  print("  lens <ax> setmax                after homing + jog to far end: store travel\r\n");
-  print("  lens <ax> travel <fs>           set travel in full steps directly\r\n");
-  print("  lens <ax> homecfg <pps> <max_fs> <backoff_fs>\r\n");
-  print("  lens <ax> homeextra <usteps>|auto  re-home search past zero (auto 4+travel/64 fs)\r\n");
-  print("  lens save | lens autohome on|off  persist calibration / home at boot\r\n");
-  print("  lens <ax> allow on|off          TEST MODE: no config/home needed (limits stay)\r\n");
-  print("  --- zoom/focus tracking (focus columns: inf 3m 1m 0.3m, x = unset) ---\r\n");
-  print("  lens track [show] | dump        table / table as re-loadable commands\r\n");
-  print("  lens track set <i> <zoom> <f_inf> [f_3m] [f_1m] [f_0.3m]   point i (0..15)\r\n");
-  print("  lens track cap <i> <inf|3m|1m|0.3m>  store current zoom+focus (calibration)\r\n");
-  print("  lens track del <i> | clear\r\n");
-  print("  lens track follow on|off        focus follows every zoom move/jog\r\n");
-  print("  lens track dist <mm>|inf        hold focus at this object distance now\r\n");
-  print("  lens track goto <zoom> [mm|inf] zoom with focus tracking (one-shot)\r\n");
-  print("  old: zoom_run/focus_run/iris_run <dir> <step_hz>, *_stop, focus_dump\r\n");
+  print("lens commands  (<ax> = z|zoom f|focus u1 u2; pos in usteps, 16 per full step; speeds full steps/s)\r\n");
+  print("  lens [status]                    positions and driver state\r\n");
+  print("  lens init                        re-write both driver configs\r\n");
+  print("  lens stop                        stop all axes\r\n");
+  print("  lens <ax> goto <pos>             absolute move\r\n");
+  print("  lens <ax> rel <+-usteps>         relative move\r\n");
+  print("  lens <ax> jog <1|0> [pps]        run fwd/rev until stop, limit or 30 s\r\n");
+  print("  lens <ax> stop | halt            ramped stop | immediate stop\r\n");
+  print("  lens <ax> home                   run home_fs reverse into the stop, pos := 0\r\n");
+  print("  lens <ax> zero                   pos := 0 here (sets reference)\r\n");
+  print("  lens <ax> limit <min> <max>|off  soft limits (max -1 = none)\r\n");
+  print("  lens <ax> travel <usteps>        forward limit applied by home/zero (0 = none)\r\n");
+  print("  lens <ax> homecfg <pps> <fs>     homing speed and distance\r\n");
+  print("  lens <ax> speed <start> <max> <acc>   start<=800, max<=1200\r\n");
+  print("  lens <ax> cur <irun> [ihold]     0..31 (voltage mode: amplitude = VS*(irun+1)/32)\r\n");
+  print("  lens z lock [pos] | unlock      zoom fixed at pos (default: here); locked at boot\r\n");
+  print("  lens <ax> reg <r> [val]          raw TMC2300 register read/write\r\n");
+  print("  lens f best                      focus to the calibrated best position\r\n");
+  print("  zoom_run|focus_run <dir> <step_hz>, zoom_stop|focus_stop   old jog commands\r\n");
 }
 
-static void cli_axis(Axis_t *a, LensAxis_t ax, char **tok, int nt, LensPrintFn print)
+static void reply_move(bool ok, Axis_t *a, LensPrintFn print)
 {
-  const char *op = nt > 0 ? tok[0] : "status";
-  long v1 = 0, v2 = 0, v3 = 0;
-  bool ok = true;
+  if (ok) snprintf(s_buf, sizeof s_buf, "OK %s: pos %ld -> %ld\r\n", a == &s_ax[LENS_ZOOM] ? "zoom" : "focus",
+                   (long)a->pos, (long)a->target);
+  else snprintf(s_buf, sizeof s_buf, "ERROR: %s\r\n", s_err);
+  print(s_buf);
+}
 
-  if (!strcmp(op, "goto") && nt >= 2 && parse_long(tok[1], &v1)) {
-    ok = LENS_MoveTo(ax, (int32_t)v1);
-  } else if (!strcmp(op, "rel") && nt >= 2 && parse_long(tok[1], &v1)) {
-    ok = LENS_MoveRel(ax, (int32_t)v1);
-  } else if (!strcmp(op, "jog") && nt >= 2 && parse_long(tok[1], &v1)) {
+static void cli_axis(LensAxis_t ax, char **tok, int nt, LensPrintFn print)
+{
+  Axis_t *a = &s_ax[ax];
+  long v1, v2, v3;
+  const char *op = nt > 0 ? tok[0] : "status";
+
+  if (!strcmp(op, "status")) { print_axis(ax, print); return; }
+  if (ax == LENS_FOCUS && !strcmp(op, "best")) {
+    snprintf(s_buf, sizeof s_buf, "best focus %ld\r\n", (long)s_focus_best); print(s_buf);
+    reply_move(LENS_MoveTo(ax, s_focus_best), a, print); return;
+  }
+  if (ax == LENS_ZOOM && !strcmp(op, "unlock")) { s_zoom_locked = false; print("OK zoom unlocked\r\n"); return; }
+  if (ax == LENS_ZOOM && !strcmp(op, "lock")) {
+    long p = a->pos;
+    if (nt >= 2 && !parse_long(tok[1], &p)) { print("ERROR: lock [pos]\r\n"); return; }
+    if ((int32_t)p != a->pos && !(boot_check() && move_to(ax, (int32_t)p))) { snprintf(s_buf, sizeof s_buf, "ERROR: %s\r\n", s_err); print(s_buf); return; }
+    s_zoom_fixed = (int32_t)p; s_zoom_locked = true;
+    snprintf(s_buf, sizeof s_buf, "OK zoom locked at %ld\r\n", p); print(s_buf); return;
+  }
+  if (!strcmp(op, "goto") && nt >= 2 && parse_long(tok[1], &v1)) { reply_move(LENS_MoveTo(ax, (int32_t)v1), a, print); return; }
+  if (!strcmp(op, "rel")  && nt >= 2 && parse_long(tok[1], &v1)) { reply_move(LENS_MoveRel(ax, (int32_t)v1), a, print); return; }
+  if (!strcmp(op, "jog")  && nt >= 2 && parse_long(tok[1], &v1)) {
+    v2 = 0;
     if (nt >= 3 && !parse_long(tok[2], &v2)) { print("ERROR: pps\r\n"); return; }
-    ok = LENS_Jog(ax, (int)v1, (uint32_t)v2);
-  } else if (!strcmp(op, "stop")) {
-    LENS_Stop(ax);
-  } else if (!strcmp(op, "halt")) {
-    LENS_Halt(ax);
-  } else if (!strcmp(op, "zero")) {
-    if (!a->allow_nocfg) { print("ERROR: zero is set by homing (lens <ax> home); test mode only\r\n"); return; }
-    if (a->running) { print("ERROR: moving\r\n"); return; }
-    a->pos = 0;
-  } else if (!strcmp(op, "limit") && nt >= 3 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2)) {
-    if (!a->allow_nocfg) { print("ERROR: raw limits only in test mode - use travel/setmax\r\n"); return; }
-    a->min_pos = (int32_t)v1;
-    a->max_pos = (v2 < 0) ? (int32_t)(a->home_max_fs * a->mres) : (int32_t)v2;
-    if (v2 > 0) { a->travel_known = 1; a->warn &= (uint8_t)~W_TRAVEL; home_fit_travel(a); }
-  } else if (!strcmp(op, "speed") && nt >= 4 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2) &&
-             parse_long(tok[3], &v3)) {
-    if (v1 < 20 || v1 > (long)LENS_START_PPS_MAX || v2 < v1 || v2 > (long)LENS_SLEW_PPS_MAX || v3 < 10) {
-      print("ERROR: need 20<=start<=800, start<=max<=1200, acc>=10\r\n"); return;
+    bool ok = LENS_Jog(ax, v1 ? 1 : 0, (uint32_t)(v2 > 0 ? v2 : 0));
+    if (ok) snprintf(s_buf, sizeof s_buf, "OK %s jog %s at %lu pps\r\n", LENS_AxisName[ax],
+                     v1 ? "fwd" : "rev", (unsigned long)(a->v_max / MRES));
+    else snprintf(s_buf, sizeof s_buf, "ERROR: %s\r\n", s_err);
+    print(s_buf); return;
+  }
+  if (!strcmp(op, "stop")) { LENS_Stop(ax); print("OK stopping\r\n"); return; }
+  if (!strcmp(op, "halt")) { LENS_Halt(ax); print("OK halted\r\n"); return; }
+  if (!strcmp(op, "home")) {
+    if (home_cmd(ax)) snprintf(s_buf, sizeof s_buf, "OK %s homing: %lu fs reverse at %lu pps\r\n",
+                           LENS_AxisName[ax], (unsigned long)a->home_fs, (unsigned long)a->home_pps);
+    else snprintf(s_buf, sizeof s_buf, "ERROR: %s\r\n", s_err);
+    print(s_buf); return;
+  }
+  if (!strcmp(op, "zero")) { print(zero(ax) ? "OK pos 0, reference set\r\n" : "ERROR: busy\r\n"); return; }
+  if (!strcmp(op, "limit") && nt >= 2) {
+    if (!strcmp(tok[1], "off")) { a->limits_on = false; print("OK limits off\r\n"); return; }
+    if (nt >= 3 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2)) {
+      a->min_pos = (int32_t)v1; a->max_pos = v2 < 0 ? POS_FAR : (int32_t)v2; a->limits_on = true;
+      print("OK limits set\r\n"); return;
+    }
+  }
+  if (!strcmp(op, "travel") && nt >= 2 && parse_long(tok[1], &v1) && v1 >= 0) {
+    a->travel = (int32_t)v1;
+    if (a->referenced) a->max_pos = a->travel > 0 ? a->travel : POS_FAR;
+    print("OK travel set\r\n"); return;
+  }
+  if (!strcmp(op, "homecfg") && nt >= 3 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2) &&
+      v1 >= 20 && v1 <= PPS_START_MAX && v2 > 0) {
+    a->home_pps = (uint32_t)v1; a->home_fs = (uint32_t)v2; print("OK homecfg\r\n"); return;
+  }
+  if (!strcmp(op, "speed") && nt >= 4 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2) && parse_long(tok[3], &v3)) {
+    if (a->running) { print("ERROR: busy\r\n"); return; }
+    if (v1 < 20 || v1 > PPS_START_MAX || v2 < v1 || v2 > PPS_SLEW_MAX || v3 < 50) {
+      print("ERROR: need 20<=start<=800, start<=max<=1200, acc>=50\r\n"); return;
     }
     a->start_pps = (uint32_t)v1; a->max_pps = (uint32_t)v2; a->acc_pps2 = (uint32_t)v3;
-    axis_rates(a);
-  } else if (!strcmp(op, "cur") && nt >= 2 && parse_long(tok[1], &v1)) {
-    if (nt >= 3 && !parse_long(tok[2], &v2)) { print("ERROR: ihold\r\n"); return; }
-    if (v1 < 0 || v1 > 31 || v2 < 0 || v2 > 31) { print("ERROR: 0..31\r\n"); return; }
-    a->irun = (uint8_t)v1; a->ihold = (uint8_t)v2;
-    ok = axis_configure(a);
-  } else if (!strcmp(op, "mres") && nt >= 2 && parse_long(tok[1], &v1)) {
-    if (a->running) { print("ERROR: moving\r\n"); return; }
-    if (v1 != 1 && v1 != 2 && v1 != 4 && v1 != 8 && v1 != 16 && v1 != 32 && v1 != 64) {
-      print("ERROR: 1,2,4,8,16,32,64\r\n"); return;
-    }
-    uint16_t old = a->mres;
-    a->pos = (int32_t)((int64_t)a->pos * v1 / old);
-    if (a->max_pos != POS_FAR) a->max_pos = (int32_t)((int64_t)a->max_pos * v1 / old);
-    a->min_pos = (int32_t)((int64_t)a->min_pos * v1 / old);
-    a->mres = (uint16_t)v1;
-    axis_rates(a);
-    ok = axis_configure(a);
-  } else if (!strcmp(op, "addr") && nt >= 2 && parse_long(tok[1], &v1) && v1 >= 0 && v1 <= 3) {
-    a->addr = (uint8_t)v1;
-    ok = axis_configure(a);
-  } else if (!strcmp(op, "sg") && nt >= 2 && parse_long(tok[1], &v1) && v1 >= 0 && v1 <= 255) {
-    a->sg_thr = (uint8_t)v1;
-    ok = axis_configure(a);
-  } else if (!strcmp(op, "home")) {
-    LensErr_t e = LENS_Home(ax); ok = (e == E_OK); s_last_err = e;
-  } else if (!strcmp(op, "clr")) {
-    LENS_Halt(ax); a->fault = 0; a->comm_fail = 0;
-    ok = axis_configure(a);
-    a->state = AX_UNHOMED;
-    if (!ok) s_last_err = E_NODRV;
-  } else if (!strcmp(op, "travel") && nt >= 2 && parse_long(tok[1], &v1) && v1 > 0) {
-    a->max_pos = (int32_t)(v1 * a->mres); a->travel_known = 1; a->warn &= (uint8_t)~W_TRAVEL;
-    home_fit_travel(a);
-  } else if (!strcmp(op, "setmax")) {
-    if (a->state != AX_READY) { print("ERROR: home first (lens <ax> home)\r\n"); return; }
-    if (a->running || a->pos <= 0) { print("ERROR: jog to the far end first, idle\r\n"); return; }
-    a->max_pos = a->pos - (int32_t)(a->home_backoff_fs * a->mres);
-    a->travel_known = 1; a->warn &= (uint8_t)~W_TRAVEL;
-    home_fit_travel(a);
-    snprintf(s_buf, sizeof s_buf, "travel %ld usteps (%ld fs), homing max %lu fs - 'lens save' to keep\r\n",
-             (long)a->max_pos, (long)(a->max_pos / (int32_t)a->mres), (unsigned long)a->home_max_fs);
-    print(s_buf);
-  } else if (!strcmp(op, "homecfg") && nt >= 4 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2) &&
-             parse_long(tok[3], &v3)) {
-    if (v1 < 50 || v1 > (long)LENS_START_PPS_MAX || v2 < 50 || v2 > 20000 || v3 < 0 || v3 > 500) {
-      print("ERROR: pps 50..800, max_fs 50..20000, backoff_fs 0..500\r\n"); return;
-    }
-    a->home_pps = (uint32_t)v1; a->home_max_fs = (uint32_t)v2; a->home_backoff_fs = (uint32_t)v3;
-  } else if (!strcmp(op, "homeextra") && nt >= 2) {
-    if (!strcmp(tok[1], "auto")) a->home_extra = -1;
-    else if (parse_long(tok[1], &v1) && v1 >= 0 && v1 <= 20000) a->home_extra = (int32_t)v1;
-    else { print("ERROR: homeextra <usteps 0..20000>|auto\r\n"); return; }
-  } else if (!strcmp(op, "allow") && nt >= 2) {
-    a->allow_nocfg = !strcmp(tok[1], "on");
-    if (a->allow_nocfg)
-      print("TEST MODE: moves allowed without driver config and without homing. Soft limits,\r\n"
-            "          faults, timeouts, heat and jog dead-man stay active. Unconfigured drivers\r\n"
-            "          run at reset settings (IRUN 31, 32 ustep); 40 ohm coils cap current ~VS/40.\r\n");
-  } else if (!strcmp(op, "dump")) {
-    dump_axis(a, print); return;
-  } else if (!strcmp(op, "reg") && nt >= 2 && parse_long(tok[1], &v1)) {
-    uint32_t r;
-    if (nt >= 3 && parse_long(tok[2], &v2)) tmc_write(a->addr, (uint8_t)v1, (uint32_t)v2);
-    if (tmc_read(a->addr, (uint8_t)v1, &r))
-      snprintf(s_buf, sizeof s_buf, "reg 0x%02lX = 0x%08lX\r\n", (unsigned long)v1, (unsigned long)r);
-    else
-      snprintf(s_buf, sizeof s_buf, "reg 0x%02lX: no reply (write-only or absent)\r\n", (unsigned long)v1);
-    print(s_buf); return;
-  } else if (!strcmp(op, "status")) {
-    /* fall through to the status line */
-  } else {
-    print("ERROR: lens help\r\n"); return;
+    print("OK speed set\r\n"); return;
   }
-
-  snprintf(s_buf, sizeof s_buf, "%s %s: pos %ld %s%s\r\n", ok ? "OK" : "REJECTED", LENS_AxisName[ax],
-           (long)a->pos, a->running ? "moving " : "", ok ? "" : s_err_name[s_last_err]);
-  print(s_buf);
+  if (!strcmp(op, "cur") && nt >= 2 && parse_long(tok[1], &v1) && v1 >= 0 && v1 <= 31) {
+    v2 = a->ihold;
+    if (nt >= 3 && (!parse_long(tok[2], &v2) || v2 < 0 || v2 > 31)) { print("ERROR: ihold 0..31\r\n"); return; }
+    a->irun = (uint8_t)v1; a->ihold = (uint8_t)v2;
+    print(drv_config(a) ? "OK current set\r\n" : "ERROR: driver config failed\r\n"); return;
+  }
+  if (!strcmp(op, "reg") && nt >= 2 && parse_long(tok[1], &v1) && v1 >= 0 && v1 < 0x80) {
+    uint32_t val;
+    if (nt >= 3) {
+      if (!parse_long(tok[2], &v2)) { print("ERROR: value\r\n"); return; }
+      tmc_write(a->addr, (uint8_t)v1, (uint32_t)v2);
+      print("OK written\r\n"); return;
+    }
+    if (tmc_read(a->addr, (uint8_t)v1, &val)) snprintf(s_buf, sizeof s_buf, "reg 0x%02lx = 0x%08lx\r\n", (unsigned long)v1, (unsigned long)val);
+    else snprintf(s_buf, sizeof s_buf, "ERROR: no reply\r\n");
+    print(s_buf); return;
+  }
+  print("ERROR: bad lens command (lens help)\r\n");
 }
 
 bool LENS_CLI(const char *cmd, LensPrintFn print)
 {
-  char line[128];
-  strncpy(line, cmd, sizeof line - 1);
-  line[sizeof line - 1] = 0;
+  char line[96];
+  strncpy(line, cmd, sizeof line - 1u);
+  line[sizeof line - 1u] = '\0';
   for (char *p = line; *p; p++) *p = (char)tolower((unsigned char)*p);
 
-  char *tok[10]; int nt = 0;
-  for (char *t = strtok(line, " \t"); t && nt < 10; t = strtok(NULL, " \t")) tok[nt++] = t;
+  char *tok[8]; int nt = 0;
+  for (char *t = strtok(line, " \t"); t && nt < 8; t = strtok(NULL, " \t")) tok[nt++] = t;
   if (nt == 0) return false;
 
-  /* legacy bring-up commands */
-  const char *legacy[] = { "zoom", "focus", "iris" };
-  for (int i = 0; i < LENS_NAXIS; i++) {
-    size_t n = strlen(legacy[i]);
-    if (!strncmp(tok[0], legacy[i], n) && tok[0][n] == '_') {
-      const char *suf = tok[0] + n + 1;
-      long dir, hz;
-      if (!strcmp(suf, "run") && nt >= 3 && parse_long(tok[1], &dir) && parse_long(tok[2], &hz) && hz > 0) {
-        /* old units: STEP pulses per second -> full steps per second */
-        uint32_t pps = (uint32_t)hz / s_ax[i].mres;
-        if (pps < 20u) pps = 20u;
-        bool ok = LENS_Jog((LensAxis_t)i, (int)dir, pps);
-        snprintf(s_buf, sizeof s_buf, "%s: %s jog dir %ld at %lu pps (%lu step/s)%s%s\r\n", ok ? "SUCCESS" : "REJECTED",
-                 LENS_AxisName[i], dir, (unsigned long)(s_ax[i].v_max / s_ax[i].mres),
-                 (unsigned long)s_ax[i].v_max, ok ? "" : " - ", ok ? "" : s_err_name[s_last_err]);
-        print(s_buf);
-        return true;
+  /* old jog commands: <axis>_run <dir> <step_hz> (STEP pulses/s), <axis>_stop */
+  for (int i = LENS_ZOOM; i <= LENS_FOCUS; i++) {
+    size_t n = strlen(LENS_AxisName[i]);
+    if (strncmp(tok[0], LENS_AxisName[i], n) || tok[0][n] != '_') continue;
+    const char *suf = tok[0] + n + 1;
+    long dir, hz;
+    if (!strcmp(suf, "stop")) { LENS_Stop((LensAxis_t)i); print("SUCCESS: stopping\r\n"); return true; }
+    if (!strcmp(suf, "run")) {
+      if (nt < 3 || !parse_long(tok[1], &dir) || !parse_long(tok[2], &hz) || hz <= 0) {
+        print("ERROR: usage <axis>_run <0|1> <step_hz>, step_hz > 0\r\n"); return true;
       }
-      if (!strcmp(suf, "stop")) {
-        LENS_Stop((LensAxis_t)i);
-        snprintf(s_buf, sizeof s_buf, "SUCCESS: %s stopping\r\n", LENS_AxisName[i]);
-        print(s_buf);
-        return true;
-      }
-      if (!strcmp(suf, "dump")) { scan_report(print); dump_axis(&s_ax[i], print); return true; }
-      return false;
+      uint32_t pps = (uint32_t)hz / MRES;
+      if (pps < 20u) pps = 20u;
+      if (LENS_Jog((LensAxis_t)i, dir ? 1 : 0, pps))
+        snprintf(s_buf, sizeof s_buf, "SUCCESS: %s jog dir %ld at %lu pps (%lu step/s)\r\n", LENS_AxisName[i],
+                 dir ? 1L : 0L, (unsigned long)(s_ax[i].v_max / MRES), (unsigned long)s_ax[i].v_max);
+      else snprintf(s_buf, sizeof s_buf, "REJECTED: %s\r\n", s_err);
+      print(s_buf); return true;
     }
+    return false;
   }
 
-  if (strcmp(tok[0], "lens") != 0) return false;
+  if (strcmp(tok[0], "lens")) return false;
   if (nt == 1 || !strcmp(tok[1], "status")) { print_status(print); return true; }
   if (!strcmp(tok[1], "help")) { print_help(print); return true; }
-  if (!strcmp(tok[1], "scan")) { scan_report(print); return true; }
-  if (!strcmp(tok[1], "init")) { config_report(print); return true; }
-  if (!strcmp(tok[1], "track")) { cli_track(&tok[2], nt - 2, print); return true; }
-  if (!strcmp(tok[1], "home") && (nt == 2 || !strcmp(tok[2], "all"))) {
-    for (int i = 0; i < LENS_NAXIS; i++) {
-      if (i == LENS_IRIS) continue;
-      LensErr_t e = LENS_Home((LensAxis_t)i);
-      snprintf(s_buf, sizeof s_buf, "home %s: %s\r\n", LENS_AxisName[i], e == E_OK ? "started" : s_err_name[e]);
-      print(s_buf);
-    }
-    return true;
-  }
-  if (!strcmp(tok[1], "clr") && (nt == 2 || !strcmp(tok[2], "all"))) {
-    for (int i = 0; i < LENS_NAXIS; i++) {
-      Axis_t *a = &s_ax[i];
-      LENS_Halt((LensAxis_t)i); a->fault = 0; a->comm_fail = 0;
-      axis_configure(a); a->state = AX_UNHOMED;
-    }
-    print_status(print); return true;
-  }
-  if (!strcmp(tok[1], "save")) {
-    const char *e = cfg_save();
-    print(e ? "ERROR: save " : "OK calibration saved to flash\r\n");
-    if (e) { print(e); print("\r\n"); }
-    return true;
-  }
-  if (!strcmp(tok[1], "autohome") && nt >= 3) {
-    s_autohome = !strcmp(tok[2], "on");
-    print(s_autohome ? "OK autohome on (lens save to keep)\r\n" : "OK autohome off\r\n");
-    return true;
-  }
-  if (!strcmp(tok[1], "stop")) {
-    for (int i = 0; i < LENS_NAXIS; i++) LENS_Stop((LensAxis_t)i);
-    print("OK stopping all\r\n"); return true;
+  if (!strcmp(tok[1], "stop")) { LENS_Stop(LENS_ZOOM); LENS_Stop(LENS_FOCUS); print("OK stopping all\r\n"); return true; }
+  if (!strcmp(tok[1], "init")) {
+    if (s_ax[LENS_ZOOM].running || s_ax[LENS_FOCUS].running) { print("ERROR: busy\r\n"); return true; }
+    bool z = drv_config(&s_ax[LENS_ZOOM]), f = drv_config(&s_ax[LENS_FOCUS]);
+    snprintf(s_buf, sizeof s_buf, "zoom %s, focus %s\r\n", z ? "ok" : "FAILED", f ? "ok" : "FAILED");
+    print(s_buf); return true;
   }
   int ax = parse_axis(tok[1]);
-  if (ax < 0) { print("ERROR: axis z|f|i (lens help)\r\n"); return true; }
-  cli_axis(&s_ax[ax], (LensAxis_t)ax, &tok[2], nt - 2, print);
+  if (ax < 0) { print("ERROR: axis z|f|u1|u2 (lens help)\r\n"); return true; }
+  cli_axis((LensAxis_t)ax, &tok[2], nt - 2, print);
   return true;
 }
 
-/* ====================================================== SOC host link ==== */
-/* Line protocol on UART4 / J12, 115200 8N1, '\n' or '\r' terminated, ASCII,
-   case-insensitive. Positions in microsteps (default 16 per full step).
-     Z <pos>    F <pos>       absolute move        -> OK Z <target>
-     ZR <d>     FR <d>        relative move        -> OK Z <target>
-     ZS  FS  S                decelerated stop     -> OK STOP
-     P  or  ?                 position query       -> POS Z <pos> <m> F <pos> <m>
-     ZERO Z|F|ALL             set position to 0    -> OK ZERO
-     V                        version              -> VER PROXY-LENS 1
-     Tracking table (zoom/focus correlation; lost at reset - SoC reloads it):
-     TC                       clear table          -> OK TC
-     TS <i> <z> <fi> [f3 f1 f03]  set point i (x = unset) -> OK TS <i>
-     TG <i>                   get point            -> TP <i> <z> <fi> <f3> <f1> <f03>
-     TN                       points / follow      -> TN <n> <follow> <dist_mm|0=inf>
-     TF 0|1                   focus follows zoom   -> OK TF <0|1>
-     TD <mm>                  focus to distance now (0 = inf) -> OK TD <focus>
-     ZF <z> [mm]              zoom + tracked focus -> OK ZF <z> <focus>
-     Guard rails (docs/lens-control-design.md):
-     H Z|F|ALL                home against the reverse stop -> OK H; then
-                              DONE Z 0 homed | DONE Z <pos> home-abort
-     ST                       -> ST Z <state> <pos> <fault> <warn> F ...
-                              state UNHOMED|HOMING|READY|FAULT, fault/warn hex
-     CLR Z|F|ALL              clear faults, re-configure (axis -> UNHOMED)
-     ZJ <0|1> [pps] / FJ ...  dead-man jog: repeat within 600 ms or it stops
-     LIM Z|F <fs>             set calibrated travel (full steps)
-     SAVE                     persist calibration + tracking table to flash
-   Moves need state READY (home first). Errors:
-     ERR SYNTAX|RANGE|BUSY|NODRV|FAULT|HOME|HOT
-   Unsolicited on every stop:  DONE Z <pos> <reason>
-     reason: done stop limit stall deadman homed home-abort unhomed
-             driver-reset fault-<NOCFG|DRV|OT|SHORT|COMM|TIMEOUT>          */
-static void reply_err(LensPrintFn reply)
+/* ====================================================== SoC host link ==== */
+/* UART4 / J12, 115200 8N1, one command per line, case-insensitive.
+   Positions in microsteps (16 per full step).
+     Z <pos>   F <pos>      absolute move     -> OK Z <target>
+     ZR <d>    FR <d>       relative move     -> OK Z <target>
+     ZS  FS  S              ramped stop       -> OK STOP
+     H Z|F|ALL              home              -> OK H, later DONE Z 0 homed
+     ZERO Z|F|ALL           pos := 0 here     -> OK ZERO
+     P  or  ?               positions         -> POS Z <pos> <moving> F <pos> <moving>
+     FB                     focus to calibrated best -> OK F <pos>
+     V                      version           -> VER PROXY-LENS 3
+   At boot the MCU homes both axes, moves zoom to its fixed step and focus to
+   the calibrated best, then sends READY. Until then moves get ERR BUSY.
+   Zoom is locked: Z / ZR get ERR LOCKED. Focus moves from above go 1000
+   below the goal first and finish upward (gear backlash).
+   Errors: ERR SYNTAX | ERR BUSY | ERR RANGE | ERR NODRV | ERR LOCKED
+   Unsolicited on every stop: DONE Z|F <pos> <reason>                       */
+static void host_err(LensPrintFn reply)
 {
-  char o[24]; snprintf(o, sizeof o, "ERR %s\n", s_err_name[s_last_err]); reply(o);
+  if (!strncmp(s_err, "busy", 4)) reply("ERR BUSY\n");
+  else if (!strncmp(s_err, "zoom locked", 11)) reply("ERR LOCKED\n");
+  else if (!strcmp(s_err, "outside soft limits")) reply("ERR RANGE\n");
+  else reply("ERR NODRV\n");
 }
 
-static int host_axis(const char *t)
+static int host_which(const char *w)    /* bit0 zoom, bit1 focus */
 {
-  if (!strcmp(t, "Z")) return LENS_ZOOM;
-  if (!strcmp(t, "F")) return LENS_FOCUS;
-  if (!strcmp(t, "ALL")) return LENS_NAXIS;
-  return -1;
+  if (!w) return 0;
+  if (!strcmp(w, "Z")) return 1;
+  if (!strcmp(w, "F")) return 2;
+  if (!strcmp(w, "ALL")) return 3;
+  return 0;
 }
+
 void LENS_HostCommand(const char *line, LensPrintFn reply)
 {
-  char l[96];
-  size_t n = 0;
-  for (const char *p = line; *p && n < sizeof l - 1; p++) l[n++] = (char)toupper((unsigned char)*p);
-  l[n] = 0;
-  char *tok[8]; int nt = 0;
-  for (char *t = strtok(l, " \t,"); t && nt < 8; t = strtok(NULL, " \t,")) tok[nt++] = t;
-  if (nt == 0) return;
-
-  char out[96];
-  const char *c = tok[0];
+  char b[64], out[80];
+  strncpy(b, line, sizeof b - 1u);
+  b[sizeof b - 1u] = '\0';
+  for (char *p = b; *p; p++) *p = (char)toupper((unsigned char)*p);
+  char *c = strtok(b, " \t"), *arg = strtok(NULL, " \t");
+  if (!c) return;
   long v;
 
+  if (!strcmp(c, "V")) { reply("VER PROXY-LENS 3\n"); return; }
   if (!strcmp(c, "P") || !strcmp(c, "?")) {
-    snprintf(out, sizeof out, "POS Z %ld %d F %ld %d\n",
-             (long)s_ax[LENS_ZOOM].pos, LENS_IsMoving(LENS_ZOOM),
-             (long)s_ax[LENS_FOCUS].pos, LENS_IsMoving(LENS_FOCUS));
+    snprintf(out, sizeof out, "POS Z %ld %d F %ld %d\n", (long)s_ax[LENS_ZOOM].pos, s_ax[LENS_ZOOM].running,
+             (long)s_ax[LENS_FOCUS].pos, s_ax[LENS_FOCUS].running);
     reply(out); return;
   }
-  if (!strcmp(c, "V")) { reply("VER PROXY-LENS 2\n"); return; }
-
-  /* ---- tracking table ---- */
-  if (c[0] == 'T' && c[1] && !c[2]) {
-    long i = 0, z = 0;
-    uint8_t idx[TRK_MAX];
-    switch (c[1]) {
-      case 'C': memset(s_trk, 0, sizeof s_trk); reply("OK TC\n"); return;
-      case 'S': {
-        if (nt < 4 || !parse_long(tok[1], &i) || i < 0 || i >= TRK_MAX || !parse_long(tok[2], &z)) break;
-        TrkPt_t p = { 1, (int32_t)z, { TRK_UNSET, TRK_UNSET, TRK_UNSET, TRK_UNSET } };
-        for (int k = 0; k < TRK_COLS && 3 + k < nt; k++) {
-          if (!strcmp(tok[3 + k], "X")) continue;
-          long fv; if (!parse_long(tok[3 + k], &fv)) { reply("ERR SYNTAX\n"); return; }
-          p.focus[k] = (int32_t)fv;
-        }
-        s_trk[i] = p;
-        snprintf(out, sizeof out, "OK TS %ld\n", i); reply(out); return;
-      }
-      case 'G': {
-        if (nt < 2 || !parse_long(tok[1], &i) || i < 0 || i >= TRK_MAX) break;
-        if (!s_trk[i].used) { reply("ERR RANGE\n"); return; }
-        char v[TRK_COLS][12];
-        for (int k = 0; k < TRK_COLS; k++) {
-          if (s_trk[i].focus[k] == TRK_UNSET) strcpy(v[k], "X");
-          else snprintf(v[k], sizeof v[k], "%ld", (long)s_trk[i].focus[k]);
-        }
-        snprintf(out, sizeof out, "TP %ld %ld %s %s %s %s\n", i, (long)s_trk[i].zoom, v[0], v[1], v[2], v[3]);
-        reply(out); return;
-      }
-      case 'N':
-        snprintf(out, sizeof out, "TN %d %d %ld\n", trk_sorted(idx), s_trk_follow,
-                 s_trk_dpt > 0.0f ? lroundf(1000.0f / s_trk_dpt) : 0L);
-        reply(out); return;
-      case 'F':
-        if (nt < 2 || !parse_long(tok[1], &i)) break;
-        s_trk_follow = i ? 1u : 0u;
-        if (s_trk_follow) trk_capture();
-        snprintf(out, sizeof out, "OK TF %d\n", s_trk_follow); reply(out); return;
-      case 'D':
-        if (nt < 2 || !parse_long(tok[1], &i) || i < 0) break;
-        if (trk_sorted(idx) == 0) { reply("ERR RANGE\n"); return; }
-        if ((s_last_err = gate(&s_ax[LENS_FOCUS], true)) != E_OK) { reply_err(reply); return; }
-        trk_set_distance((uint32_t)(i > 0 && i < 100 ? 100 : i));
-        snprintf(out, sizeof out, "OK TD %ld\n", (long)axis_goal(&s_ax[LENS_FOCUS])); reply(out); return;
-      default: break;
-    }
-    reply("ERR SYNTAX\n"); return;
+  if (!strcmp(c, "FB")) {
+    if (!LENS_MoveTo(LENS_FOCUS, s_focus_best)) { host_err(reply); return; }
+    snprintf(out, sizeof out, "OK F %ld\n", (long)s_focus_best); reply(out); return;
   }
-  if (!strcmp(c, "ZF")) {
-    long z, mm = -1;
-    uint8_t idx[TRK_MAX];
-    if (nt < 2 || !parse_long(tok[1], &z) || (nt >= 3 && (!parse_long(tok[2], &mm) || mm < 0))) {
-      reply("ERR SYNTAX\n"); return;
-    }
-    if ((s_last_err = gate(&s_ax[LENS_ZOOM], true)) != E_OK ||
-        (s_last_err = gate(&s_ax[LENS_FOCUS], true)) != E_OK) { reply_err(reply); return; }
-    if (trk_sorted(idx) == 0) { reply("ERR RANGE\n"); return; }
-    if (nt >= 3) s_trk_dpt = mm > 0 ? 1000.0f / (float)(mm < 100 ? 100 : mm) : 0.0f;
-    else trk_capture();
-    uint8_t f = s_trk_follow;
-    s_trk_follow = 1;
-    bool ok = move_to_raw(LENS_ZOOM, (int32_t)z);
-    if (ok) trk_focus_to((int32_t)z);
-    s_trk_follow = f;
-    if (!ok) { reply_err(reply); return; }
-    snprintf(out, sizeof out, "OK ZF %ld %ld\n", z, (long)axis_goal(&s_ax[LENS_FOCUS]));
+  if (!strcmp(c, "S"))  { LENS_Stop(LENS_ZOOM); LENS_Stop(LENS_FOCUS); reply("OK STOP\n"); return; }
+  if (!strcmp(c, "ZS")) { LENS_Stop(LENS_ZOOM);  reply("OK STOP\n"); return; }
+  if (!strcmp(c, "FS")) { LENS_Stop(LENS_FOCUS); reply("OK STOP\n"); return; }
+
+  if ((!strcmp(c, "Z") || !strcmp(c, "F") || !strcmp(c, "ZR") || !strcmp(c, "FR"))) {
+    if (!parse_long(arg, &v)) { reply("ERR SYNTAX\n"); return; }
+    LensAxis_t ax = c[0] == 'Z' ? LENS_ZOOM : LENS_FOCUS;
+    bool ok = c[1] == 'R' ? LENS_MoveRel(ax, (int32_t)v) : LENS_MoveTo(ax, (int32_t)v);
+    if (!ok) { host_err(reply); return; }
+    snprintf(out, sizeof out, "OK %c %ld\n", c[0], (long)s_ax[ax].target);
     reply(out); return;
   }
-  if (!strcmp(c, "S")) { LENS_Stop(LENS_ZOOM); LENS_Stop(LENS_FOCUS); reply("OK STOP\n"); return; }
-
-  if (!strcmp(c, "ST")) {
-    const Axis_t *z = &s_ax[LENS_ZOOM], *f = &s_ax[LENS_FOCUS];
-    snprintf(out, sizeof out, "ST Z %s %ld %X %X F %s %ld %X %X\n",
-             s_state_name[z->state], (long)z->pos, z->fault, z->warn,
-             s_state_name[f->state], (long)f->pos, f->fault, f->warn);
-    reply(out); return;
-  }
-  if (!strcmp(c, "H") || !strcmp(c, "CLR")) {
-    int w = nt > 1 ? host_axis(tok[1]) : LENS_NAXIS;
-    if (w < 0) { reply("ERR SYNTAX\n"); return; }
-    LensErr_t res = E_OK;
-    for (int i = 0; i < LENS_NAXIS - 1; i++) {          /* zoom, focus */
-      if (w != LENS_NAXIS && w != i) continue;
-      if (c[0] == 'H') {
-        LensErr_t e = LENS_Home((LensAxis_t)i);
-        if (e != E_OK) res = e;
-      } else {
-        Axis_t *a = &s_ax[i];
-        LENS_Halt((LensAxis_t)i); a->fault = 0; a->comm_fail = 0;
-        if (!axis_configure(a)) res = E_NODRV;
-        a->state = AX_UNHOMED;
-      }
+  if (!strcmp(c, "H") || !strcmp(c, "ZERO")) {
+    int w = host_which(arg);
+    if (!w) { reply("ERR SYNTAX\n"); return; }
+    bool is_home = c[0] == 'H';
+    for (int i = 0; i < 2; i++) {
+      if (!(w & (1 << i))) continue;
+      LensAxis_t ax = i ? LENS_FOCUS : LENS_ZOOM;
+      if (!(is_home ? home_cmd(ax) : zero(ax))) { host_err(reply); return; }
     }
-    if (res != E_OK) { s_last_err = res; reply_err(reply); return; }
-    reply(c[0] == 'H' ? "OK H\n" : "OK CLR\n"); return;
+    reply(is_home ? "OK H\n" : "OK ZERO\n"); return;
   }
-  if (!strcmp(c, "ZJ") || !strcmp(c, "FJ")) {
-    long d, pps = 0;
-    if (nt < 2 || !parse_long(tok[1], &d) || (nt >= 3 && !parse_long(tok[2], &pps)) || pps < 0) {
-      reply("ERR SYNTAX\n"); return;
-    }
-    LensAxis_t jax = c[0] == 'Z' ? LENS_ZOOM : LENS_FOCUS;
-    if (!jog_start(jax, (int)d, (uint32_t)pps, JOG_DEADMAN_HOST_MS, true)) { reply_err(reply); return; }
-    reply("OK J\n"); return;
-  }
-  if (!strcmp(c, "LIM")) {
-    long fs;
-    int w = nt > 1 ? host_axis(tok[1]) : -1;
-    if (w < 0 || w == LENS_NAXIS || nt < 3 || !parse_long(tok[2], &fs) || fs <= 0 || fs > 20000) {
-      reply("ERR SYNTAX\n"); return;
-    }
-    Axis_t *a = &s_ax[w];
-    a->max_pos = (int32_t)(fs * a->mres); a->travel_known = 1; a->warn &= (uint8_t)~W_TRAVEL;
-    home_fit_travel(a);
-    reply("OK LIM\n"); return;
-  }
-  if (!strcmp(c, "SAVE")) {
-    const char *e = cfg_save();
-    if (e) { snprintf(out, sizeof out, "ERR SAVE %s\n", e); reply(out); }
-    else reply("OK SAVE\n");
-    return;
-  }
-  if (!strcmp(c, "ZERO")) {
-    reply("ERR SYNTAX\n"); return;   /* removed: zero is set by homing (H) only */
-    const char *w = nt > 1 ? tok[1] : "ALL";
-    if (LENS_IsMoving(LENS_ZOOM) || LENS_IsMoving(LENS_FOCUS)) { reply("ERR BUSY\n"); return; }
-    if (!strcmp(w, "Z") || !strcmp(w, "ALL")) s_ax[LENS_ZOOM].pos = 0;
-    if (!strcmp(w, "F") || !strcmp(w, "ALL")) s_ax[LENS_FOCUS].pos = 0;
-    reply("OK ZERO\n"); return;
-  }
-
-  LensAxis_t ax;
-  if (c[0] == 'Z') ax = LENS_ZOOM; else if (c[0] == 'F') ax = LENS_FOCUS;
-  else { reply("ERR SYNTAX\n"); return; }
-  const char *sub = c + 1;
-
-  if (!strcmp(sub, "S")) { LENS_Stop(ax); reply("OK STOP\n"); return; }
-  if ((strcmp(sub, "") && strcmp(sub, "R")) || nt < 2 || !parse_long(tok[1], &v)) {
-    reply("ERR SYNTAX\n"); return;
-  }
-  bool ok = (*sub == 'R') ? LENS_MoveRel(ax, (int32_t)v) : LENS_MoveTo(ax, (int32_t)v);
-  if (!ok) { reply_err(reply); return; }
-  snprintf(out, sizeof out, "OK %c %ld\n", ax == LENS_ZOOM ? 'Z' : 'F',
-           (long)(s_ax[ax].pend_valid ? s_ax[ax].pend_target :
-                  s_ax[ax].running ? s_ax[ax].target : s_ax[ax].pos));
-  reply(out);
+  reply("ERR SYNTAX\n");
 }
