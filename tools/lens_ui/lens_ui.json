@@ -1,0 +1,41 @@
+{
+  "rules": {
+    "zoom_chunk": 4000,
+    "focus_chunk": 4000,
+    "zoom_approach": "below",
+    "zoom_backoff": 600,
+    "focus_approach": "down",
+    "focus_overshoot": 600,
+    "rehome_focus_before_stage": false,
+    "zoom_min": -64000,
+    "zoom_max": 64000,
+    "focus_min": 0,
+    "focus_max": 32400,
+    "settle_ms": 300
+  },
+  "session": {
+    "apply_on_connect": false,
+    "focus_allow": true,
+    "focus_limit": [
+      -64000,
+      64000
+    ],
+    "focus_speed": [
+      200,
+      1200,
+      2000
+    ]
+  },
+  "stages": [
+    {
+      "name": "Zoom0 (homed: lens z 0, lens f 9854)",
+      "zoom": 52000,
+      "focus": 4400
+    },
+    {
+      "name": "Stage 2",
+      "zoom": 72000,
+      "focus": 9854
+    }
+  ]
+}

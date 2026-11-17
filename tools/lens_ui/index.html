@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lens Stage Control</title>
+<style>
+/* Layout: camera + manual controls on the left, stages / rules / log on the right */
+:root{
+  --bg:#eef1f4; --panel:#ffffff; --fg:#18202b; --muted:#5d6878; --line:#d6dce4;
+  --accent:#1f6fb2; --accent-fg:#ffffff; --ok:#2e7d4f; --warn:#b5651d; --bad:#b23a3a; --sel:#e3eefa;
+  --mono:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace; --sans:system-ui,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#11151b; --panel:#1a2029; --fg:#e3e8ef; --muted:#97a2b2; --line:#2c3541;
+  --accent:#5aa2e0; --accent-fg:#0d1620; --ok:#6fcf97; --warn:#e0a060; --bad:#e57373; --sel:#1f3247; color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}
+header{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0 8px 0 0}
+.pill{font:12px var(--mono);padding:3px 8px;border-radius:4px;border:1px solid var(--line);white-space:nowrap}
+.pill b{font-weight:600}
+.pill.ok{border-color:var(--ok);color:var(--ok)} .pill.warn{border-color:var(--warn);color:var(--warn)} .pill.bad{border-color:var(--bad);color:var(--bad)}
+.grow{flex:1}
+main{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:16px;padding:16px;max-width:1500px;margin:0 auto}
+@media (max-width:980px){main{grid-template-columns:1fr}}
+.col{display:grid;gap:16px;align-content:start;min-width:0}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px;min-width:0}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px}
+.cam{position:relative;background:#000;border-radius:4px;overflow:hidden;aspect-ratio:16/9}
+.cam img{width:100%;height:100%;object-fit:contain;display:block}
+.cam .over{position:absolute;left:8px;top:8px;font:13px var(--mono);background:rgba(0,0,0,.6);color:#fff;padding:3px 8px;border-radius:3px}
+.cam .none{position:absolute;inset:0;display:grid;place-items:center;color:#aaa;font-size:13px}
+.meter{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}
+.meter i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.axis{display:grid;grid-template-columns:70px 1fr;gap:8px;align-items:center;margin-bottom:10px}
+.axis label{font-weight:600}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+button{font:13px var(--sans);padding:5px 10px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:4px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent)}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+button.pri{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+button.stop{background:var(--bad);color:#fff;border-color:var(--bad);font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+input,select{font:13px var(--mono);padding:4px 6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:4px}
+input[type=number]{width:92px}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{font-size:12px;color:var(--muted);font-weight:500}
+tr.cur td{background:var(--sel)}
+td input.name{width:90px;font-family:var(--sans)}
+.rules{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px 16px}
+.rules label{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:13px}
+.hint{color:var(--muted);font-size:12px;margin:8px 0 0}
+#log{font:12px/1.5 var(--mono);height:220px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:6px 8px;white-space:pre-wrap;margin:0}
+#msg{font-size:13px;color:var(--muted)}
+#msg.err{color:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Lens Stage Control</h1>
+  <span class="pill" id="pz">zoom –</span>
+  <span class="pill" id="pf">focus –</span>
+  <span class="pill" id="pstage">stage –</span>
+  <span class="pill" id="pbusy">idle</span>
+  <span class="grow"></span>
+  <span id="msg"></span>
+  <button class="stop" id="stop">STOP</button>
+</header>
+
+<main>
+<div class="col">
+  <section>
+    <h2>Camera</h2>
+    <div class="cam"><img id="cam" alt="Live camera frame"><div class="none" id="camnone">Waiting for camera…</div><div class="over" id="sharp">sharp –</div></div>
+    <div class="meter"><i id="bar"></i></div>
+    <p class="hint">Sharpness: about 20,000 is sharp on the test scene, a few hundred is blurred.</p>
+  </section>
+
+  <section>
+    <h2>Manual move</h2>
+    <div class="axis"><label for="zg">lens z – U1 @0x00 (focus motor)</label>
+      <div class="row">
+        <input type="number" id="zg" step="100"><button data-goto="z">Go</button>
+        <button data-jog="z" data-d="-100">−100</button><button data-jog="z" data-d="-20">−20</button>
+        <button data-jog="z" data-d="20">+20</button><button data-jog="z" data-d="100">+100</button>
+        <button data-home="z">Home</button>
+      </div></div>
+    <div class="axis"><label for="fg">lens f – U2 @0x02 (zoom motor)</label>
+      <div class="row">
+        <input type="number" id="fg" step="100"><button data-goto="f">Go</button>
+        <button data-jog="f" data-d="-500">−500</button><button data-jog="f" data-d="-100">−100</button><button data-jog="f" data-d="-20">−20</button>
+        <button data-jog="f" data-d="20">+20</button><button data-jog="f" data-d="100">+100</button><button data-jog="f" data-d="500">+500</button>
+        <button data-home="f">Home</button>
+      </div></div>
+    <div class="row"><button data-home="all">Home both</button><button id="sess">Apply session settings</button>
+      <span class="grow"></span>
+      <input id="raw" placeholder="console command, e.g. lens" style="width:220px;font-family:var(--mono)"><button id="rawgo">Send</button></div>
+    <p class="hint">All moves use the rules below. Focus jogs upward also end with the downward approach.</p>
+  </section>
+</div>
+
+<div class="col">
+  <section>
+    <h2>Zoom stages</h2>
+    <div class="tbl"><table>
+      <thead><tr><th>Stage</th><th>lens z (U1 focus motor)</th><th>lens f (U2 zoom motor)</th><th></th><th></th></tr></thead>
+      <tbody id="stages"></tbody>
+    </table></div>
+    <div class="row" style="margin-top:8px">
+      <button id="addst">Add stage</button><button id="savest" class="pri">Save table</button>
+    </div>
+    <p class="hint">Go: moves to the stage. Then adjust focus with the manual buttons and press “Save focus” to store the current focus for that stage.</p>
+  </section>
+
+  <section>
+    <h2>Movement rules</h2>
+    <div class="rules" id="rules"></div>
+    <div class="row" style="margin-top:10px"><button id="saverules" class="pri">Save rules</button></div>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</div>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+let S=null, stagesDirty=false, rulesDirty=false;
+const RULES=[
+  ["zoom_chunk","Zoom max step","number"],["focus_chunk","Focus max step","number"],
+  ["zoom_approach","Zoom approach",["below","above","any"]],["zoom_backoff","Zoom back-off","number"],
+  ["focus_approach","Focus final move",["down","up","any"]],["focus_overshoot","Focus overshoot","number"],
+  ["rehome_focus_before_stage","Re-home focus per stage","checkbox"],["settle_ms","Settle after move (ms)","number"],
+  ["zoom_min","Zoom min","number"],["zoom_max","Zoom max","number"],
+  ["focus_min","Focus min","number"],["focus_max","Focus max","number"],
+];
+function msg(t,err){const m=$("msg");m.textContent=t;m.className=err?"err":"";}
+async function post(url,body){
+  try{const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json(); msg(j.ok?"":(j.msg||"error"),!j.ok); return j;}catch(e){msg("No connection to the UI server",true);}
+}
+const act=b=>post("/api/do",b).then(poll);
+
+function buildRules(cfg){
+  const box=$("rules"); box.innerHTML="";
+  for(const [k,label,t] of RULES){
+    const l=document.createElement("label"); l.textContent=label; let el;
+    if(Array.isArray(t)){el=document.createElement("select"); t.forEach(o=>el.add(new Option(o,o)));}
+    else{el=document.createElement("input"); el.type=t;}
+    el.id="r_"+k;
+    if(t==="checkbox") el.checked=!!cfg.rules[k]; else el.value=cfg.rules[k];
+    el.addEventListener("input",()=>rulesDirty=true);
+    l.appendChild(el); box.appendChild(l);
+  }
+}
+function buildStages(cfg){
+  const tb=$("stages"); tb.innerHTML="";
+  cfg.stages.forEach((s,i)=>{
+    const tr=document.createElement("tr"); tr.dataset.i=i;
+    tr.innerHTML=`<td><input class="name" id="sn${i}" value=""></td>
+      <td><input type="number" id="sz${i}" step="100"></td>
+      <td><input type="number" id="sf${i}" step="100"></td>
+      <td><button class="pri" data-stage="${i}">Go</button></td>
+      <td><button data-savef="${i}" title="Store current focus for this stage">Save focus</button>
+          <button data-del="${i}" title="Delete stage">✕</button></td>`;
+    tb.appendChild(tr);
+    $("sn"+i).value=s.name; $("sz"+i).value=s.zoom; $("sf"+i).value=s.focus;
+    ["sn","sz","sf"].forEach(p=>$(p+i).addEventListener("input",()=>stagesDirty=true));
+  });
+}
+function readStages(){return [...$("stages").rows].map((r,i)=>({name:$("sn"+i).value,zoom:+$("sz"+i).value,focus:+$("sf"+i).value}));}
+
+function pill(el,txt,cls){el.textContent=txt;el.className="pill "+(cls||"");}
+function render(){
+  const z=S.status.zoom, f=S.status.focus;
+  const cls=a=>!a?"bad":a.fault!=="-"?"bad":a.state==="READY"?"ok":"warn";
+  pill($("pz"),z?`lens z ${z.pos} ${z.state}${z.motion!=="idle"?" ▸":""}`:"zoom ?",cls(z));
+  pill($("pf"),f?`lens f ${f.pos} ${f.state}${f.motion!=="idle"?" ▸":""}`:"focus ?",cls(f));
+  pill($("pstage"),S.stage!=null&&S.cfg.stages[S.stage]?`at ${S.cfg.stages[S.stage].name}`:"no stage",S.stage!=null?"ok":"");
+  pill($("pbusy"),S.busy?S.busy+"…":"idle",S.busy?"warn":"");
+  document.querySelectorAll("main button").forEach(b=>{b.disabled=!!S.busy&&!b.closest("#rules")});
+  [...$("stages").rows].forEach((r,i)=>r.classList.toggle("cur",S.stage===i));
+  $("sharp").textContent=S.sharp==null?"sharp –":"sharp "+Math.round(S.sharp).toLocaleString();
+  $("bar").style.width=S.sharp==null?"0":Math.min(100,S.sharp/250)+"%";
+  const lg=$("log"), atEnd=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-4;
+  lg.textContent=S.log.join("\n"); if(atEnd) lg.scrollTop=lg.scrollHeight;
+  if(document.activeElement!==$("zg")&&z&&!$("zg").value) $("zg").value=z.pos;
+  if(document.activeElement!==$("fg")&&f&&!$("fg").value) $("fg").value=f.pos;
+}
+let first=true;
+async function poll(){
+  try{const r=await fetch("/api/state"); S=await r.json();}catch(e){msg("No connection to the UI server",true);return;}
+  if(first||(!stagesDirty&&S.cfg.stages.length!==$("stages").rows.length)){buildStages(S.cfg);}
+  if(first) buildRules(S.cfg);
+  if(!stagesDirty) S.cfg.stages.forEach((s,i)=>{if($("sz"+i)&&document.activeElement.closest("#stages")==null){$("sn"+i).value=s.name;$("sz"+i).value=s.zoom;$("sf"+i).value=s.focus;}});
+  first=false; render();
+}
+setInterval(poll,700); poll();
+const img=$("cam"); img.onload=()=>$("camnone").hidden=true; img.onerror=()=>$("camnone").hidden=false;
+setInterval(()=>{img.src="/live.jpg?t="+Date.now();},500);
+
+document.addEventListener("click",async e=>{
+  const b=e.target.closest("button"); if(!b) return; const d=b.dataset;
+  if(d.stage!==undefined){
+    if(stagesDirty&&!(await saveStages())) return;
+    act({action:"stage",index:+d.stage});
+  }
+  else if(d.savef!==undefined){ await post("/api/do",{action:"save_focus",index:+d.savef}); stagesDirty=false; first=true; poll(); }
+  else if(d.del!==undefined){ const st=readStages(); st.splice(+d.del,1); stagesDirty=true; S.cfg.stages=st; buildStages(S.cfg); }
+  else if(d.goto){ const v=$(d.goto==="z"?"zg":"fg").value; if(v!=="") act({action:"goto",axis:d.goto,pos:+v}); }
+  else if(d.jog){ act({action:"jog",axis:d.jog,delta:+d.d}); $(d.jog==="z"?"zg":"fg").value=""; }
+  else if(d.home){ act({action:"home",axis:d.home}); }
+});
+async function saveStages(){const j=await post("/api/config",{stages:readStages()}); if(j&&j.ok){stagesDirty=false;msg("Stage table saved");return true;} return false;}
+$("savest").onclick=saveStages;
+$("addst").onclick=()=>{const st=readStages(); const z=S.status.zoom?.pos??0, f=S.status.focus?.pos??0;
+  st.push({name:"Stage "+(st.length+1),zoom:z,focus:f}); S.cfg.stages=st; stagesDirty=true; buildStages(S.cfg);};
+$("saverules").onclick=async()=>{
+  const r={}; for(const [k,,t] of RULES){const el=$("r_"+k); r[k]=t==="checkbox"?el.checked:(t==="number"?+el.value:el.value);}
+  const j=await post("/api/config",{rules:r}); if(j&&j.ok){rulesDirty=false;msg("Rules saved");}
+};
+$("stop").onclick=()=>post("/api/stop",{}).then(poll);
+$("sess").onclick=()=>act({action:"session"});
+$("rawgo").onclick=()=>{const c=$("raw").value.trim(); if(c) act({action:"raw",cmd:c});};
+$("raw").addEventListener("keydown",e=>{if(e.key==="Enter") $("rawgo").click();});
+</script>
+</body>
+</html>
