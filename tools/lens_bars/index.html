@@ -99,8 +99,11 @@
           <option value="cal">this camera</option><option value="msp">MSP430</option>
         </select>
       </div>
-      <div class="small" style="margin-top:6px">A level change homes an axis first if it has to move down, so it can take up to ~80 s.
-        Level 0 = telephoto, level 5 = wide.</div>
+      <div class="row" style="margin-top:8px">
+        <button id="lvl-rehome" onclick="if (confirm('Re-home both motors to their stops and return to this level (~80 s)?')) cmd('lens rehome')">Re-home</button>
+        <span class="small">Level changes move straight to the stored steps (10–22 s, zoom then focus).
+          Re-home only if a level looks soft. Level 0 = telephoto, level 5 = wide.</span>
+      </div>
     </div>
 
     <div class="axis" id="ax-zoom">
@@ -251,6 +254,7 @@ function drawLevels(st) {
   $('lvl-tag').className = 'tag' + (moving ? ' moving' : '');
   $('lvl-in').disabled = moving || cur >= LV.length - 1;
   $('lvl-out').disabled = moving || cur <= 0;
+  $('lvl-rehome').disabled = moving;
   if (document.activeElement !== $('lvl-table')) $('lvl-table').value = tbl;
 }
 async function setTable(t) { await cmd('lens table ' + t); }
@@ -293,6 +297,7 @@ async function poll() {
 setInterval(() => { $('cam').src = '/live.jpg?t=' + Date.now(); }, 300);
 setInterval(poll, 800);
 poll(); loadRecs(); loadLevels();
+setInterval(loadLevels, 30000);   /* picks up a new table after a reflash */
 </script>
 </body>
 </html>
