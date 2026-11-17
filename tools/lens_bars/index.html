@@ -54,6 +54,14 @@
   th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; }
   td button { padding: 2px 8px; font-size: 12px; }
+  .lvls { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+  @media (max-width: 520px) { .lvls { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  .lvls button { display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 6px 4px; }
+  .lvls button b { font-size: 16px; }
+  .lvls button span { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .lvls button.on { background: var(--accent); border-color: var(--accent); }
+  .lvls button.on b, .lvls button.on span { color: var(--accent-ink); }
+  select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
 </style>
 </head>
 <body>
@@ -78,6 +86,21 @@
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
       <h1 style="margin:0">Controls</h1>
       <button class="stop" onclick="afCancel(); cmd('lens stop')">STOP</button>
+    </div>
+
+    <div class="axis" id="ax-levels">
+      <div class="head"><h2>Zoom levels</h2><span class="tag" id="lvl-tag">–</span></div>
+      <div class="lvls" id="lvl-btns"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="lvl-out" onclick="cmd('lens zoomout')">− Zoom out (wider)</button>
+        <button id="lvl-in" onclick="cmd('lens zoomin')">Zoom in (tele) +</button>
+        <span class="small" style="margin-left:auto">focus table</span>
+        <select id="lvl-table" onchange="setTable(this.value)">
+          <option value="cal">this camera</option><option value="msp">MSP430</option>
+        </select>
+      </div>
+      <div class="small" style="margin-top:6px">A level change homes an axis first if it has to move down, so it can take up to ~80 s.
+        Level 0 = telephoto, level 5 = wide.</div>
     </div>
 
     <div class="axis" id="ax-zoom">
@@ -210,6 +233,27 @@ function showAF(af) {
   $('af-cancel').disabled = !af.running;
   drawAF(af);
 }
+let LV = [];
+async function loadLevels() {
+  try { LV = await (await fetch('/api/levels')).json(); } catch (e) { LV = []; }
+  drawLevels(last);
+}
+function drawLevels(st) {
+  const tbl = (st && st.table) || 'cal', cur = st ? st.level : -1;
+  const moving = st && ((st.zoom && st.zoom.moving) || (st.focus && st.focus.moving));
+  $('lvl-btns').innerHTML = LV.map(l => {
+    const f = tbl === 'msp' ? l.focus_msp : l.focus_cal;
+    const name = l.level === 0 ? 'tele' : l.level === LV.length - 1 ? 'wide' : '';
+    return `<button class="${l.level === cur ? 'on' : ''}" ${moving ? 'disabled' : ''} onclick="cmd('lens level ${l.level}')"
+      title="zoom ${l.zoom}, focus ${f}"><b>L${l.level}</b><span>${name || '&nbsp;'}</span><span>z ${l.zoom}</span><span>f ${f}</span></button>`;
+  }).join('');
+  $('lvl-tag').textContent = (cur == null || cur < 0) ? 'no level (moved by hand)' : `level ${cur}` + (moving ? ' · moving' : '');
+  $('lvl-tag').className = 'tag' + (moving ? ' moving' : '');
+  $('lvl-in').disabled = moving || cur >= LV.length - 1;
+  $('lvl-out').disabled = moving || cur <= 0;
+  if (document.activeElement !== $('lvl-table')) $('lvl-table').value = tbl;
+}
+async function setTable(t) { await cmd('lens table ' + t); }
 async function goBoth(z, f) { await cmd(`lens z goto ${z}`); await cmd(`lens f goto ${f}`); }
 
 for (const name of ['zoom', 'focus']) {
@@ -236,6 +280,7 @@ async function poll() {
     showAxis('zoom', st.zoom, st.locked);
     showAxis('focus', st.focus, null);
     showAF(st.af);
+    drawLevels(st);
     $('zoom-unlock').disabled = st.locked == null;
     if (st.sharp != null) {
       best = Math.max(best, st.sharp);
@@ -247,7 +292,7 @@ async function poll() {
 }
 setInterval(() => { $('cam').src = '/live.jpg?t=' + Date.now(); }, 300);
 setInterval(poll, 800);
-poll(); loadRecs();
+poll(); loadRecs(); loadLevels();
 </script>
 </body>
 </html>

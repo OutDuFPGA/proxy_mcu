@@ -27,7 +27,20 @@ LIVE = os.path.join(HERE, "..", "lens_ui", ".live.jpg")
 REC = os.path.join(HERE, "positions.json")
 LENS_UI = "http://localhost:8090"
 LINE = re.compile(r"^(zoom|focus)\s+(\S+)\s+(\S+)\s+pos\s+(-?\d+)\s+\(.*?\)\s+(\S+)\s+(\S+)\s+lim\s+(\S+)")
+LOCK = re.compile(r"(LOCKED|unlocked) at (-?\d+) \(level (-?\d+), focus table (\w+)\)")
+LEVEL_ROW = re.compile(r"^\s*(\d)(\*?)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*$")
 _lock = threading.Lock()
+
+
+def levels():
+    """Parse 'lens level': lvl zoom focus_cal focus_msp."""
+    rows = []
+    for line in raw("lens level").splitlines():
+        m = LEVEL_ROW.match(line)
+        if m:
+            rows.append({"level": int(m.group(1)), "current": m.group(2) == "*", "zoom": int(m.group(3)),
+                         "focus_cal": int(m.group(4)), "focus_msp": int(m.group(5))})
+    return rows
 
 
 def raw(cmd):
@@ -63,10 +76,11 @@ def status():
             out[ax] = {"drv": m.group(2), "cfg": m.group(3), "pos": int(m.group(4)),
                        "moving": m.group(5) in ("MOVING", "HOMING"), "state": m.group(5),
                        "ref": m.group(6) == "ref", "lim": m.group(7)}
-        if "LOCKED at" in line:
-            out["locked"] = int(line.split("LOCKED at")[1].split()[0])
-        elif "unlocked, fixed pos" in line:
-            out["locked"] = None
+        lm = LOCK.search(line)
+        if lm:
+            out["locked"] = int(lm.group(2)) if lm.group(1) == "LOCKED" else None
+            out["level"] = int(lm.group(3))
+            out["table"] = lm.group(4)
     return out
 
 
@@ -204,6 +218,8 @@ def handler():
                     st["sharp"] = sharpness()
                     st["af"] = {k: v for k, v in AF.items() if k != "cancel"}
                     return self.send(200, st)
+                if p == "/api/levels":
+                    return self.send(200, levels())
                 if p == "/api/records":
                     return self.send(200, json.load(open(REC)) if os.path.exists(REC) else [])
             except Exception as e:
