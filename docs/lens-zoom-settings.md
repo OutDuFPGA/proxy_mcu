@@ -1,5 +1,27 @@
 # Lens motor settings – zoom and focus
 
+> **2026-11-17 ~12:00 IST – firmware state (committed).** Zoom referenced to its **reverse stop** (home 150 pps, up to
+> 4 500 fs), locked at **9 599** (Zoom0). Focus homes slowly (100 pps, 3 000 fs) to its **real reverse stop**; best focus
+> **0** at zoom 9 599 (sharpness 914 / 911 over two boots – the peak is at the focus stop, so this view cannot get
+> fully sharp). Both axes 100/150 pps; every move finishes upward.
+> The far-zoom sharp view below (zoom "far stop − 3 394", focus 17 200 / 11 700) is **not reproducible**: homing
+> 72 000 µsteps forward met no hard stop, so zoom crept ~68 600 further per boot. To keep that view, its zoom count
+> must be found again from the reverse stop.
+
+
+> **2026-11-17 ~11:30 IST – SHARP POSITION recorded, both axes referenced to mechanical stops (user set zoom by hand).**
+> | Axis | Steps (µsteps, 16/fs) | Reference |
+> |---|---|---|
+> | Zoom (U2, `lens z`) | count **168 304** = **far (forward) stop − 3 394** (−212 fs) | far stop reached at count 171 698 by a long 100 pps jog; then 10 pps back / 3 pps forward |
+> | Focus (U1, `lens f`) | **17 200** above the **reverse stop** (1 075 fs) | `lens f homecfg 100 3000` + `lens f home` (slow home reaches the real stop; 300 pps stalls ~800–1 600 short) |
+>
+> Focus sweep from the stop, day mode, centre-1/3 Sobel: coarse peak 17 000 (17 911), fine peak **17 200 = 20 535**
+> (17 100: 20 407, 17 300: 20 355; half-height ~16 750..17 750). Home -> 17 200 three times: 20 479 / 20 419 / 20 405 (0.6 %).
+> Long moves DOWN lose steps (~3 000 over a 23 500 move at 150 pps): always re-home focus, then approach from below.
+> Frame: `tools/focus_cal/best_zoomfar-3394_f17200.jpg`; data: `tools/focus_cal/results.json` (`sweep_from_stop`).
+> Not in the firmware yet (it still has zoom 9599 from the old home, focus best 0).
+
+
 > **2026-11-17 ~10:40 IST – focus-only control, zoom locked, focus calibrated (`tools/focus_cal.py`).**
 > Zoom locked at **9 599** (Zoom0 view); `lens z lock [pos]` / `unlock`. SoC `Z`/`ZR` -> `ERR LOCKED`.
 > At boot the MCU homes both axes, zoom -> 9 599, focus -> best, then sends `READY` (moves before that: `ERR BUSY`).

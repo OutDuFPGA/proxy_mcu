@@ -71,7 +71,8 @@ typedef struct {
   uint8_t  irun, ihold;
   uint32_t start_pps, max_pps, acc_pps2;
   uint32_t home_pps, home_fs;
-  int32_t  travel;            /* forward soft limit after referencing       */
+  int8_t   home_dir;          /* -1: home = reverse stop, +1: home = forward stop */
+  int32_t  travel;            /* soft-limit span from the home stop, 0 = none */
   /* reference / limits */
   bool     referenced;        /* pos 0 is the reverse stop (home or zero)   */
   bool     limits_on;
@@ -293,22 +294,28 @@ static bool can_move(LensAxis_t ax)
 /* Zoom lock (2026-11-17, user: calibrate and control focus only, zoom stays
    at a fixed step). While locked, zoom move/jog requests are refused; homing
    is allowed and the axis then returns to the fixed position by itself. */
-#define ZOOM_FIXED_DEFAULT  9599      /* Zoom0 field of view (user, 2026-11-17) */
+/* Zoom is referenced to its REVERSE stop = 0. 9599 = the user's Zoom0 view.
+   (2026-11-17: a far-stop reference was tried and dropped - homing 72000
+   usteps forward never met a hard stop, so zoom crept ~68600 further on every
+   boot. The reverse stop is repeatable.) */
+#define ZOOM_FIXED_DEFAULT  9599
 static bool    s_zoom_locked = true;
 static int32_t s_zoom_fixed  = ZOOM_FIXED_DEFAULT;
 static char    s_lock_msg[48];
 
-/* Focus calibration, tools/focus_cal.py, 2026-11-17 (zoom 9599, day mode,
-   centre-1/3 Sobel sharpness, tools/focus_cal/results.json):
-   - sharpness peaks at the homed 0 (887, flat top: 0/100/200 = 887/881/868)
-     and falls steadily upward; home -> 0 five times: within 0.6 %.
-   - the image stops changing above ~34000 (far end, or just full blur -
-     not confirmed by eye); travel = 34000 - 1600.
-   - the homed 0 is a repeatable stall point, not the hard stop: the stop is
-     ~800..1600 lower, and moves below 0 lose steps. Keep the limit at 0. */
-#define FOCUS_BEST_DEFAULT    0       /* best focus for the installed scene, usteps */
+/* Focus calibration, tools/focus_cal.py, 2026-11-17 ~11:30 IST (zoom far
+   stop - 3394, day mode, centre-1/3 Sobel, tools/focus_cal/results.json
+   "sweep_from_stop", "sweep_zoom_farhome"). Focus 0 = the REAL reverse stop
+   (home at 100 pps; 300 pps stalls 800..1600 short of it). With zoom homed
+   to the far stop by the boot sequence (150 pps) and set to -3394, the peak
+   is 11700 = 28027 (11600 26777, 11800 27574). The by-hand zoom setting
+   measured before (focus peak 17200) was NOT the same zoom position: the
+   long hand jogs had not reached the same far stop. Long moves down lose
+   steps (~3000 in 23500 at 150 pps), so moves finish upward and the boot
+   sequence always homes first. */
+#define FOCUS_BEST_DEFAULT    0       /* zoom 9599: peak at the focus stop (850) */
 #define FOCUS_TRAVEL_DEFAULT  32400   /* forward soft limit after homing */
-#define FOCUS_BACKLASH_PRE 1000       /* moves from above go this far below, then up */
+#define BACKLASH_PRE       1000       /* moves down go this far below, then up (both axes) */
 static int32_t s_focus_best = FOCUS_BEST_DEFAULT;
 
 /* Second leg of a move that must finish from below. */
@@ -341,8 +348,8 @@ static bool move_to(LensAxis_t ax, int32_t pos)
   if (pos == a->pos) { a->target = pos; a->evt = EVT_DONE; return true; }
   a->nolimit = false;
   int32_t first = pos;
-  if (ax == LENS_FOCUS && pos < a->pos) {          /* backlash: finish upward */
-    first = pos - FOCUS_BACKLASH_PRE;
+  if (pos < a->pos) {                             /* backlash: finish upward */
+    first = pos - BACKLASH_PRE;
     if (a->limits_on && first < a->min_pos) first = a->min_pos;
     if (first < pos) { s_pend[ax] = pos; s_pend_valid[ax] = true; }
     else first = pos;
@@ -403,13 +410,19 @@ bool    LENS_IsMoving(LensAxis_t ax) { return (unsigned)ax < LENS_NAXIS && (s_ax
 int32_t LENS_GetPos(LensAxis_t ax)   { return (unsigned)ax < LENS_NAXIS ? s_ax[ax].pos : 0; }
 void    LENS_SetEventHandler(LensEventFn fn) { s_evt_fn = fn; }
 
+static void apply_limits(Axis_t *a)
+{
+  int32_t span = a->travel > 0 ? a->travel : POS_FAR;
+  if (a->home_dir > 0) { a->min_pos = -span; a->max_pos = 0; }
+  else                 { a->min_pos = 0;     a->max_pos = span; }
+}
+
 static void set_reference(Axis_t *a)
 {
   a->pos = 0;
   a->referenced = true;
   a->limits_on = true;
-  a->min_pos = 0;
-  a->max_pos = a->travel > 0 ? a->travel : POS_FAR;
+  apply_limits(a);
 }
 
 static bool zero(LensAxis_t ax)
@@ -420,9 +433,9 @@ static bool zero(LensAxis_t ax)
   return true;
 }
 
-/* Blind home: run home_fs full steps in reverse at home_pps, ignoring the
-   soft limits, into the reverse hard stop (a PM stepper at 40 ohm / 3.3 V
-   just skips there), then call that position 0. */
+/* Blind home: run home_fs full steps toward the home stop (home_dir) at
+   home_pps, ignoring the soft limits (a PM stepper at 40 ohm / 3.3 V just
+   skips at the stop), then call that position 0. */
 static bool home(LensAxis_t ax)
 {
   if (!can_move(ax)) return false;
@@ -433,7 +446,7 @@ static bool home(LensAxis_t ax)
   a->jog_until = 0;
   uint32_t save = a->start_pps;
   a->start_pps = a->home_pps;          /* constant speed: no ramp into the stop */
-  axis_start(a, 0, false, a->pos - (int32_t)(a->home_fs * MRES), a->home_pps);
+  axis_start(a, a->home_dir > 0 ? 1 : 0, false, a->pos + a->home_dir * (int32_t)(a->home_fs * MRES), a->home_pps);
   a->start_pps = save;
   return true;
 }
@@ -507,7 +520,7 @@ static void axis_hw(Axis_t *a, const char *drv, TIM_HandleTypeDef *h, uint32_t c
   a->dir_port = dp; a->dir_pin = dpin; a->en_port = ep; a->en_pin = epin; a->addr = addr;
   a->irun = 31; a->ihold = 0;
   a->start_pps = 200; a->max_pps = 300; a->acc_pps2 = 600;
-  a->home_pps = 300; a->home_fs = 1200;
+  a->home_pps = 300; a->home_fs = 1200; a->home_dir = -1;
   a->travel = 0;
   a->min_pos = 0; a->max_pos = POS_FAR;
 }
@@ -532,10 +545,11 @@ void LENS_Init(LensPrintFn print)
 
   /* Values tuned on the bench before the rewrite (2026-11-17). */
   Axis_t *zm = &s_ax[LENS_ZOOM], *fm = &s_ax[LENS_FOCUS];
-  zm->start_pps = 200; zm->max_pps = 300; zm->acc_pps2 = 600;
-  zm->home_pps = 300;  zm->home_fs = 1130; zm->travel = 16900;
-  fm->start_pps = 200; fm->max_pps = 300; fm->acc_pps2 = 1000;  /* 3.3 V: slow, no lost steps */
-  fm->home_pps = 300;  fm->home_fs = 4000; fm->travel = FOCUS_TRAVEL_DEFAULT;
+  /* 2026-11-17 ~11:30: speeds used for the sharp-position calibration. */
+  zm->start_pps = 100; zm->max_pps = 150; zm->acc_pps2 = 500;
+  zm->home_pps = 150;  zm->home_fs = 4500; zm->home_dir = -1; zm->travel = 16900; /* reverse stop, <=30 s */
+  fm->start_pps = 100; fm->max_pps = 150; fm->acc_pps2 = 500;
+  fm->home_pps = 100;  fm->home_fs = 3000; fm->home_dir = -1; fm->travel = FOCUS_TRAVEL_DEFAULT;
 
   HAL_GPIO_WritePin(u1->en_port, u1->en_pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(u2->en_port, u2->en_pin, GPIO_PIN_SET);
@@ -560,7 +574,7 @@ void LENS_Init(LensPrintFn print)
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
   if (home(LENS_ZOOM) && home(LENS_FOCUS)) {
     s_boot = 1;
-    print("[LENS] homing both axes (~15 s), then zoom fixed / focus best\r\n");
+    print("[LENS] homing both axes (~30 s: zoom to its far stop, focus to its reverse stop), then zoom fixed / focus best\r\n");
   } else {
     print("[LENS] boot homing not started: driver not configured\r\n");
   }
@@ -635,10 +649,10 @@ static void print_help(LensPrintFn print)
   print("  lens <ax> rel <+-usteps>         relative move\r\n");
   print("  lens <ax> jog <1|0> [pps]        run fwd/rev until stop, limit or 30 s\r\n");
   print("  lens <ax> stop | halt            ramped stop | immediate stop\r\n");
-  print("  lens <ax> home                   run home_fs reverse into the stop, pos := 0\r\n");
+  print("  lens <ax> home                   run into the home stop (zoom: far, focus: reverse), pos := 0\r\n");
   print("  lens <ax> zero                   pos := 0 here (sets reference)\r\n");
   print("  lens <ax> limit <min> <max>|off  soft limits (max -1 = none)\r\n");
-  print("  lens <ax> travel <usteps>        forward limit applied by home/zero (0 = none)\r\n");
+  print("  lens <ax> travel <usteps>        limit span from the home stop (0 = none)\r\n");
   print("  lens <ax> homecfg <pps> <fs>     homing speed and distance\r\n");
   print("  lens <ax> speed <start> <max> <acc>   start<=800, max<=1200\r\n");
   print("  lens <ax> cur <irun> [ihold]     0..31 (voltage mode: amplitude = VS*(irun+1)/32)\r\n");
@@ -704,7 +718,7 @@ static void cli_axis(LensAxis_t ax, char **tok, int nt, LensPrintFn print)
   }
   if (!strcmp(op, "travel") && nt >= 2 && parse_long(tok[1], &v1) && v1 >= 0) {
     a->travel = (int32_t)v1;
-    if (a->referenced) a->max_pos = a->travel > 0 ? a->travel : POS_FAR;
+    if (a->referenced) apply_limits(a);
     print("OK travel set\r\n"); return;
   }
   if (!strcmp(op, "homecfg") && nt >= 3 && parse_long(tok[1], &v1) && parse_long(tok[2], &v2) &&
