@@ -303,28 +303,29 @@ static bool can_move(LensAxis_t ax)
    focus_msp: MSP focus_level[] as written for its own scene (zoom-in table).
    focus_cal: best focus measured on this camera (day mode, centre-1/3 Sobel,
    home + approach from below), used by default; "lens table msp" switches.
-     level  zoom   focus_msp  focus_cal (sharpness; at focus_msp)
-       0   32800    25600      27100  (15987)  500 short of the far stop:
-                                              AT the stop (33300) the zoom
-                                              landed differently per approach
-                                              (focus peak 28350 vs 23000)
-       1   29300    20800      16500  (24192;   577)
-       2   25300    14200      11000  (34404;   904)
-       3   21300     9200       7200  (36801;  1878)
-       4   17300     5400       4400  (36656;  3024)
-       5   13300     1600       2250  (39854;  7155)
+     Re-calibrated 2026-11-17 18:10 (tools/focus_cal/results.json
+     "recal_zoom_far", "recal_level"): far stop 33250 by image change in
+     500 steps; each level = home + coarse 1000 + fine 100, then checked by
+     going back and by a full repeat with zoom re-homed (all within 3 %).
+     level  zoom   focus_msp  focus_cal  sharpness (back / full repeat)
+       0   32750    25600      27000     20582 (20409 / 19943)  stop - 500
+       1   29250    20800      16600     23206 (23254 / 23811)
+       2   25250    14200      11000     28199 (27842 / 27350)
+       3   21250     9200       7200     31287 (31109 / 30595)
+       4   17250     5400       4400     33595 (33647 / 32767)
+       5   13250     1600       2300     34341 (33994 / 34691)
    Zoom is referenced to its REVERSE stop = 0 (repeatable); the far stop is
    only used through the table. Focus 0 = its real reverse stop (home at
    100 pps; 300 pps stalls 800..1600 short). Long moves down lose steps, so a
    level change re-homes any axis that has to move down, then comes up. */
 typedef struct { int32_t zoom, focus_msp, focus_cal; } Level_t;
 static const Level_t s_levels[] = {
-  { 32800, 25600, 27100 }, { 29300, 20800, 16500 }, { 25300, 14200, 11000 },
-  { 21300,  9200,  7200 }, { 17300,  5400,  4400 }, { 13300,  1600,  2250 },
+  { 32750, 25600, 27000 }, { 29250, 20800, 16600 }, { 25250, 14200, 11000 },
+  { 21250,  9200,  7200 }, { 17250,  5400,  4400 }, { 13250,  1600,  2300 },
 };
 #define NLEVELS            ((int)(sizeof s_levels / sizeof s_levels[0]))
 #define BOOT_LEVEL         0
-#define ZOOM_TRAVEL        32800      /* 500 short of the far stop (~33300) */
+#define ZOOM_TRAVEL        32750      /* 500 short of the far stop (33250) */
 #define FOCUS_TRAVEL_DEFAULT  32400   /* forward soft limit after homing */
 #define BACKLASH_PRE       1000       /* moves down go this far below, then up (both axes) */
 static int8_t  s_level = -1;          /* current level, -1 = none / moved by hand */
@@ -340,7 +341,7 @@ static int32_t level_focus(int l)
   return s_use_msp ? s_levels[l].focus_msp : s_levels[l].focus_cal;
 }
 
-static uint8_t s_seq_n, s_seq_i;      /* motion sequencer (see seq_goto) */
+static uint8_t s_seq_n, s_seq_i;      /* motion sequencer (see seq_plan) */
 
 /* After-home target: home() then come up to this position. */
 static bool    s_ah_valid[LENS_NAXIS];
@@ -513,34 +514,30 @@ static void seq_add(LensAxis_t ax, uint8_t op, int32_t pos)
    or above FOCUS_SAFE_ZOOM_HOME, and focus is homed after zoom is in place. */
 #define FOCUS_SAFE_ZOOM_HOME  10000
 
-static void seq_plan(int32_t zt, int32_t ft, bool boot)
+/* full = re-reference both axes (boot, "lens rehome", or an axis without a
+   reference); otherwise a level change moves each motor DIRECTLY to its new
+   step count (user request 2026-11-17: no reset to 0 between levels). Moves
+   down still overshoot BACKLASH_PRE and finish upward (move_to). */
+static void seq_plan(int32_t zt, int32_t ft, bool full)
 {
-  int32_t zp = s_ax[LENS_ZOOM].pos, fp = s_ax[LENS_FOCUS].pos;
-  bool zr = !boot && s_ax[LENS_ZOOM].referenced, fr = !boot && s_ax[LENS_FOCUS].referenced;
+  int32_t fp = s_ax[LENS_FOCUS].pos;
+  bool zr = !full && s_ax[LENS_ZOOM].referenced, fr = !full && s_ax[LENS_FOCUS].referenced;
   s_seq_n = s_seq_i = 0;
-  if (!zr || zt < zp) {                            /* zoom must home */
+  if (zr && fr) {                                  /* direct: zoom, then focus */
+    seq_add(LENS_ZOOM, SEQ_MOVE, zt);
+    seq_add(LENS_FOCUS, SEQ_MOVE, ft);
+    return;
+  }
+  if (!zr) {                                       /* zoom must home */
     if (!fr) { seq_add(LENS_FOCUS, SEQ_HOME, 0); fr = true; fp = 0; }
     if (fp < FOCUS_SAFE_ZOOM_HOME) { seq_add(LENS_FOCUS, SEQ_MOVE, FOCUS_SAFE_ZOOM_HOME); fp = FOCUS_SAFE_ZOOM_HOME; }
     seq_add(LENS_ZOOM, SEQ_HOME, 0);
   }
   seq_add(LENS_ZOOM, SEQ_MOVE, zt);
-  if (!fr || ft < fp) seq_add(LENS_FOCUS, SEQ_HOME, 0);   /* focus zero taken at the new zoom */
+  if (!fr || full) seq_add(LENS_FOCUS, SEQ_HOME, 0);      /* focus zero taken at the new zoom */
   seq_add(LENS_FOCUS, SEQ_MOVE, ft);
 }
 
-static void seq_goto(LensAxis_t ax, int32_t pos, bool force_home)
-{
-  Axis_t *a = &s_ax[ax];
-  if (force_home || !a->referenced || pos < a->pos) {
-    s_seq[s_seq_n++] = (SeqStep_t){ (uint8_t)ax, SEQ_HOME, 0 };
-    s_seq[s_seq_n++] = (SeqStep_t){ (uint8_t)ax, SEQ_WAIT, SETTLE_MS };
-  }
-  s_seq[s_seq_n++] = (SeqStep_t){ (uint8_t)ax, SEQ_MOVE, pos };
-  /* the driver holds full current ~0.4 s after a move (TPOWERDOWN): let it
-     drop before the other motor starts, or that one stalls short (boot:
-     focus homed ~4000 above its stop right after zoom hit the far stop) */
-  s_seq[s_seq_n++] = (SeqStep_t){ (uint8_t)ax, SEQ_WAIT, SETTLE_MS };
-}
 
 static bool level_go(int l)
 {
@@ -559,7 +556,17 @@ static bool focus_level_go(void)
   if (!boot_check()) return false;
   if (LENS_IsMoving(LENS_FOCUS) || LENS_IsMoving(LENS_ZOOM) || seq_active()) { s_err = "busy"; return false; }
   s_seq_n = s_seq_i = 0;
-  seq_goto(LENS_FOCUS, level_focus(s_level), false);
+  seq_add(LENS_FOCUS, SEQ_MOVE, level_focus(s_level));   /* direct */
+  return true;
+}
+
+static bool rehome_go(void)            /* re-reference both axes, back to the level */
+{
+  if (!boot_check()) return false;
+  if (LENS_IsMoving(LENS_ZOOM) || LENS_IsMoving(LENS_FOCUS) || seq_active()) { s_err = "busy"; return false; }
+  int l = s_level < 0 ? BOOT_LEVEL : s_level;
+  seq_plan(s_levels[l].zoom, level_focus(l), true);
+  s_level = (int8_t)l; s_level_busy = true;
   return true;
 }
 
@@ -783,6 +790,7 @@ static void print_help(LensPrintFn print)
   print("  lens <ax> reg <r> [val]          raw TMC2300 register read/write\r\n");
   print("  lens level [n] | zoomin | zoomout  zoom level 0..5 (MSP430 table) with its focus\r\n");
   print("  lens table cal|msp               focus column: this camera's / MSP430 values\r\n");
+  print("  lens rehome                      re-reference both axes, return to the level\r\n");
   print("  lens f best                      focus back to the current level's focus\r\n");
   print("  zoom_run|focus_run <dir> <step_hz>, zoom_stop|focus_stop   old jog commands\r\n");
 }
@@ -936,6 +944,10 @@ bool LENS_CLI(const char *cmd, LensPrintFn print)
                                    (long)s_levels[l].zoom, (long)level_focus((int)l));
     else snprintf(s_buf, sizeof s_buf, "ERROR: %s\r\n", s_err);
     print(s_buf); return true;
+  }
+  if (!strcmp(tok[1], "rehome")) {
+    print(rehome_go() ? "OK re-homing both axes (~80 s), then back to the level\r\n" : "ERROR: busy\r\n");
+    return true;
   }
   if (!strcmp(tok[1], "table") && nt >= 3) {
     s_use_msp = !strcmp(tok[2], "msp");

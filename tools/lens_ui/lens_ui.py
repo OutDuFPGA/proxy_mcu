@@ -114,7 +114,9 @@ class Camera:
         while True:
             if self.proc is None or self.proc.poll() is not None:
                 self.proc = subprocess.Popen(
-                    ["ffmpeg", "-loglevel", "quiet", "-rtsp_transport", "tcp", "-i", self.rtsp,
+                    ["ffmpeg", "-loglevel", "quiet", "-rtsp_transport", "tcp",
+                     "-fflags", "nobuffer", "-flags", "low_delay",   # no backlog: frames lagged 2.3 s after 8 h
+                     "-i", self.rtsp,
                      "-vf", "fps=4,scale=960:540", "-q:v", "4", "-f", "image2", "-update", "1",
                      "-atomic_writing", "1", "-y", LIVE],
                     stdin=subprocess.DEVNULL)
