@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lens Bars</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --ink: #1d2330; --muted: #677085; --line: #dde1e8;
+    --accent: #2563eb; --accent-ink: #ffffff; --warn: #b45309; --bad: #b91c1c; --good: #15803d;
+    --track: #e6e9ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #11141a; --panel: #1a1f28; --ink: #e6e9ef; --muted: #98a1b3; --line: #2c3340;
+            --accent: #5b8def; --accent-ink: #0b0e13; --warn: #f0a33a; --bad: #f26d6d; --good: #4ccf7a;
+            --track: #2a303c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 16px;
+         padding: 16px; max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  h1 { font-size: 16px; margin: 0 0 10px; }
+  h2 { font-size: 13px; margin: 0; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  #cam { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; display: block; object-fit: contain; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sharp { display: flex; align-items: baseline; gap: 10px; margin-top: 10px; }
+  .sharp b { font-size: 28px; font-variant-numeric: tabular-nums; }
+  .meter { flex: 1; height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; min-width: 80px; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--good); transition: width .2s; }
+  .axis { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  .axis:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .pos { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tag { font-size: 12px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.moving { color: var(--warn); border-color: var(--warn); }
+  .tag.locked { color: var(--bad); border-color: var(--bad); }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin: 8px 0 4px; }
+  .scale { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  button { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.stop { background: var(--bad); color: #fff; border-color: var(--bad); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  input[type=number], input[type=text] { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--bg); color: var(--ink); width: 110px; }
+  input[type=text] { width: 100%; }
+  .small { font-size: 12px; color: var(--muted); }
+  #msg { min-height: 1.4em; margin-top: 8px; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  td button { padding: 2px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <section class="panel">
+    <h1>Lens bars — camera</h1>
+    <img id="cam" alt="Live camera frame">
+    <div class="sharp">
+      <span class="small">Sharpness (centre 1/3)</span>
+      <b id="sharp">–</b>
+      <div class="meter" title="relative to the best seen this session"><i id="meter"></i></div>
+      <span class="small">best <span id="best">–</span></span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button onclick="cmd('ir cut day')">IR-cut day</button>
+      <button onclick="cmd('ir cut night')">IR-cut night</button>
+      <span class="small">Steps are microsteps from each axis's reverse stop (16 per full step).</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="row" style="justify-content:space-between;margin-bottom:12px">
+      <h1 style="margin:0">Controls</h1>
+      <button class="stop" onclick="afCancel(); cmd('lens stop')">STOP</button>
+    </div>
+
+    <div class="axis" id="ax-zoom">
+      <div class="head"><h2>Zoom</h2><span class="tag" id="zoom-tag">–</span></div>
+      <div class="row" style="justify-content:space-between">
+        <span class="pos" id="zoom-pos">–</span>
+        <span class="small">target <span id="zoom-tgt">–</span></span>
+      </div>
+      <input type="range" id="zoom-bar" min="0" max="250000" step="100">
+      <div class="scale"><span>0</span><span>max <input type="number" id="zoom-max" value="250000" step="1000" style="width:100px"></span></div>
+      <div class="row" style="margin-top:8px">
+        <button onclick="rel('z',-1000)">−1000</button><button onclick="rel('z',-100)">−100</button>
+        <button onclick="rel('z',100)">+100</button><button onclick="rel('z',1000)">+1000</button>
+        <input type="number" id="zoom-num" step="100"><button class="primary" onclick="goNum('z')">Go</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button onclick="cmd('lens z home')">Home (reverse stop)</button>
+        <button id="zoom-unlock" onclick="unlockZoom()">Unlock zoom</button>
+        <button id="zoom-lock" onclick="cmd('lens z lock')">Lock here</button>
+      </div>
+    </div>
+
+    <div class="axis" id="ax-focus">
+      <div class="head"><h2>Focus</h2><span class="tag" id="focus-tag">–</span></div>
+      <div class="row" style="justify-content:space-between">
+        <span class="pos" id="focus-pos">–</span>
+        <span class="small">target <span id="focus-tgt">–</span></span>
+      </div>
+      <input type="range" id="focus-bar" min="0" max="32400" step="50">
+      <div class="scale"><span>0</span><span>max <input type="number" id="focus-max" value="32400" step="100" style="width:100px"></span></div>
+      <div class="row" style="margin-top:8px">
+        <button onclick="rel('f',-1000)">−1000</button><button onclick="rel('f',-100)">−100</button>
+        <button onclick="rel('f',100)">+100</button><button onclick="rel('f',1000)">+1000</button>
+        <input type="number" id="focus-num" step="50"><button class="primary" onclick="goNum('f')">Go</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button onclick="cmd('lens f home')">Home (reverse stop)</button>
+        <button onclick="cmd('lens f best')">Best (firmware)</button>
+      </div>
+    </div>
+
+    <div class="axis">
+      <div class="head"><h2>Autofocus</h2><span class="tag" id="af-tag">idle</span></div>
+      <div class="row">
+        <button class="primary" id="af-full" onclick="afStart('full')">Full sweep (~3 min)</button>
+        <button class="primary" id="af-local" onclick="afStart('local')">Local ±3000 (~1 min)</button>
+        <button id="af-cancel" onclick="afCancel()" disabled>Cancel</button>
+      </div>
+      <div class="small" id="af-phase" style="margin-top:6px">Zoom stays where it is; focus is swept upward and left at the sharpest point.</div>
+      <svg id="af-chart" viewBox="0 0 400 120" preserveAspectRatio="none"
+           style="width:100%;height:120px;margin-top:8px;background:var(--bg);border-radius:6px" role="img"
+           aria-label="Sharpness against focus position"></svg>
+      <div class="small" id="af-msg"></div>
+    </div>
+
+    <div class="axis">
+      <div class="head"><h2>Record position</h2></div>
+      <div class="row"><input type="text" id="note" placeholder="note, e.g. far view sharp"></div>
+      <div class="row" style="margin-top:8px"><button class="primary" onclick="recordPos()">Record zoom + focus + sharpness</button></div>
+      <table style="margin-top:10px"><thead><tr><th>time</th><th>zoom</th><th>focus</th><th>sharp</th><th>note</th><th></th></tr></thead>
+        <tbody id="recs"></tbody></table>
+    </div>
+    <div id="msg"></div>
+    <p class="small">Moves down go 1000 below the target and finish upward (gear backlash). Long moves take time: zoom
+      runs at 150 full steps/s = 2400 µsteps/s.</p>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const AX = { z: 'zoom', f: 'focus' };
+let best = 0, dragging = { zoom: false, focus: false }, last = null;
+
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json();
+}
+function say(t) { $('msg').textContent = t; }
+async function cmd(c) {
+  try {
+    const r = await post('/api/cmd', { cmd: c });
+    const lines = (r.msg || '').split(/\r?\n/).filter(l => l.trim() && l.trim() !== c);
+    say('> ' + c + '\n' + lines.slice(0, 4).join('\n'));
+    poll();
+    return r;
+  } catch (e) { say('error: ' + e); }
+}
+function rel(a, d) { cmd(`lens ${a} rel ${d}`); }
+function goTo(a, v) { cmd(`lens ${a} goto ${Math.round(v)}`); }
+function goNum(a) { const v = $(AX[a] + '-num').value; if (v !== '') goTo(a, +v); }
+async function unlockZoom() {
+  await cmd('lens z unlock');
+  await cmd(`lens z limit 0 ${+$('zoom-max').value || 250000}`);
+}
+async function recordPos() {
+  const r = await post('/api/record', { note: $('note').value });
+  say(r.ok ? `recorded zoom ${r.entry.zoom}, focus ${r.entry.focus}, sharpness ${Math.round(r.entry.sharpness || 0)}` : r.msg);
+  $('note').value = ''; loadRecs();
+}
+async function loadRecs() {
+  const rs = await (await fetch('/api/records')).json();
+  $('recs').innerHTML = rs.slice(-12).reverse().map(e =>
+    `<tr><td>${e.time.slice(11)}</td><td>${e.zoom}</td><td>${e.focus}</td><td>${e.sharpness == null ? '–' : Math.round(e.sharpness)}</td>` +
+    `<td>${(e.note || '').replace(/[<&]/g, '')}</td><td><button onclick="goBoth(${e.zoom},${e.focus})">go</button></td></tr>`).join('');
+}
+async function afStart(mode) {
+  const r = await post('/api/af/start', { mode, max: +$('focus-max').value || 32400 });
+  say(r.msg); poll();
+}
+async function afCancel() { await post('/api/af/cancel', {}); }
+function drawAF(af) {
+  const svg = $('af-chart'), pts = af.pts || [];
+  if (!pts.length) { svg.innerHTML = ''; return; }
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs) || 1, y1 = Math.max(...ys) || 1;
+  const X = x => 8 + 384 * (x1 === x0 ? 0.5 : (x - x0) / (x1 - x0)), Y = y => 112 - 104 * y / y1;
+  const dots = pts.map(p => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.5" fill="var(--accent)"/>`).join('');
+  let mark = '';
+  if (af.best) mark = `<line x1="${X(af.best.focus)}" x2="${X(af.best.focus)}" y1="4" y2="116" stroke="var(--good)" stroke-width="2"/>`;
+  svg.innerHTML = mark + dots +
+    `<text x="8" y="14" font-size="10" fill="var(--muted)">max ${Math.round(y1)}</text>` +
+    `<text x="392" y="116" font-size="10" text-anchor="end" fill="var(--muted)">${x0}…${x1}</text>`;
+}
+function showAF(af) {
+  if (!af) return;
+  $('af-tag').textContent = af.running ? 'running · ' + af.mode : (af.phase || 'idle');
+  $('af-tag').className = 'tag' + (af.running ? ' moving' : '');
+  if (af.running || af.phase) $('af-phase').textContent = af.phase + (af.running ? ` · ${af.pts.length} points` : '');
+  $('af-msg').textContent = af.msg || '';
+  $('af-full').disabled = $('af-local').disabled = af.running;
+  $('af-cancel').disabled = !af.running;
+  drawAF(af);
+}
+async function goBoth(z, f) { await cmd(`lens z goto ${z}`); await cmd(`lens f goto ${f}`); }
+
+for (const name of ['zoom', 'focus']) {
+  const bar = $(name + '-bar'), a = name[0];
+  bar.addEventListener('input', () => { dragging[name] = true; $(name + '-tgt').textContent = bar.value; });
+  bar.addEventListener('change', () => { dragging[name] = false; goTo(a, bar.value); });
+  $(name + '-max').addEventListener('change', e => { bar.max = e.target.value; });
+}
+
+function showAxis(name, s, locked) {
+  if (!s) return;
+  $(name + '-pos').textContent = s.pos.toLocaleString('en-US');
+  const tag = $(name + '-tag');
+  let t = s.state + (s.ref ? '' : ' · unreferenced') + ' · lim ' + s.lim;
+  tag.className = 'tag' + (s.moving ? ' moving' : '');
+  if (name === 'zoom' && locked != null) { t = 'LOCKED at ' + locked; tag.className = 'tag locked'; }
+  tag.textContent = t;
+  if (!dragging[name]) { $(name + '-bar').value = s.pos; $(name + '-tgt').textContent = s.pos; }
+}
+async function poll() {
+  try {
+    const st = await (await fetch('/api/state')).json();
+    last = st;
+    showAxis('zoom', st.zoom, st.locked);
+    showAxis('focus', st.focus, null);
+    showAF(st.af);
+    $('zoom-unlock').disabled = st.locked == null;
+    if (st.sharp != null) {
+      best = Math.max(best, st.sharp);
+      $('sharp').textContent = Math.round(st.sharp).toLocaleString('en-US');
+      $('best').textContent = Math.round(best).toLocaleString('en-US');
+      $('meter').style.width = (100 * st.sharp / best).toFixed(1) + '%';
+    } else { $('sharp').textContent = 'no frame'; }
+  } catch (e) { say('state error: ' + e); }
+}
+setInterval(() => { $('cam').src = '/live.jpg?t=' + Date.now(); }, 300);
+setInterval(poll, 800);
+poll(); loadRecs();
+</script>
+</body>
+</html>

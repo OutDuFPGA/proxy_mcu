@@ -1,5 +1,28 @@
 # Lens motor settings – zoom and focus
 
+> **2026-11-17 ~14:30 IST – MSP430 zoom levels ported, verified (firmware committed).**
+> Source: `MSP430_Varifocal/main.c` v1.5 – 6 zoom levels `{0,4000,…,20000}` from its zoom home, focus per level
+> `{25600,20800,14200,9200,5400,1600}` (zoom-in) / `{24000,16400,12200,8400,4200,1600}` (zoom-out), both homed with
+> a 108 000-step slam. Mapped onto this lens by measuring best focus vs zoom (`zoom_focus_curve`, `zoom_far_stop`):
+> same 1/16 scale; MSP zoom home = our zoom **far stop (~33 300, telephoto end)**; MSP focus home = our focus reverse stop.
+>
+> | Level | Zoom | Focus (MSP430) | Focus (this camera, used) | Sharpness |
+> |---|---|---|---|---|
+> | 0 (tele) | 32 800 | 25 600 | **27 100** | 15 987 |
+> | 1 | 29 300 | 20 800 | **16 500** | ~20 000–24 000 |
+> | 2 | 25 300 | 14 200 | **11 000** | 34 404 |
+> | 3 | 21 300 | 9 200 | **7 200** | 36 801 |
+> | 4 | 17 300 | 5 400 | **4 400** | 36 656 |
+> | 5 (wide) | 13 300 | 1 600 | **2 250** | 39 854 |
+>
+> Rules learned (all in `lens_ctrl.c`): one motor at a time (both at once at 3.3 V lost steps); full blind homes
+> (shortened homes missed the stop); 1 s settle after each step; level 0 kept 500 short of the far stop (at the stop
+> the zoom landed differently per approach); **zoom only homes with focus ≥ 10 000** (with focus at 0 the zoom stop
+> moved – level 3 2 028 vs 36 335); moves down re-home that axis, then come up. Verified: 3 boots to level 0 (16 139–16 386),
+> level changes 0↔5, 2, 3, 4 within ~5 % of calibration; level 1 ~20 000 (cal 24 192); one level 5 outlier (21 003),
+> two repeats 39 799 / 40 884. Console `lens level [n]`, `lens zoomin|zoomout`, `lens table cal|msp`; SoC `L n`, `ZI`, `ZO`, `FB`.
+
+
 > **2026-11-17 ~12:00 IST – firmware state (committed).** Zoom referenced to its **reverse stop** (home 150 pps, up to
 > 4 500 fs), locked at **9 599** (Zoom0). Focus homes slowly (100 pps, 3 000 fs) to its **real reverse stop**; best focus
 > **0** at zoom 9 599 (sharpness 914 / 911 over two boots – the peak is at the focus stop, so this view cannot get
