@@ -188,8 +188,11 @@ static void axis_finish(Axis_t *a, Evt_t why)
   a->evt = (uint8_t)why;
 }
 
+static void poslog_moving(void);
+static void poslog_task(void);
 static void axis_start(Axis_t *a, int dir, bool jog, int32_t target, uint32_t max_pps)
 {
+  poslog_moving();                     /* before any step: position unknown until idle again */
   uint32_t vmax = max_pps ? max_pps : a->max_pps;
   uint32_t vst  = a->start_pps < vmax ? a->start_pps : vmax;
   a->v_start = (float)vst * MRES;
@@ -485,6 +488,7 @@ static bool zero(LensAxis_t ax)
   if (!boot_check()) return false;
   if (!ax_ok(ax) || LENS_IsMoving(ax)) { s_err = "busy"; return false; }
   set_reference(&s_ax[ax]);
+  poslog_moving();                     /* re-logged as IDLE on the next task pass */
   return true;
 }
 
@@ -656,6 +660,7 @@ void LENS_Task(void)
     a->timed_out = false;
   }
   boot_task();
+  poslog_task();
 }
 
 /* ============================================================== init ===== */
@@ -672,6 +677,117 @@ static void axis_hw(Axis_t *a, const char *drv, TIM_HandleTypeDef *h, uint32_t c
 }
 
 static void print_status(LensPrintFn print);
+
+/* ===================================================== position log ===== */
+/* Boot without homing (user request 2026-11-18: power-up to level 0 in ~5 s;
+   blind homing alone takes ~2 min at the 150 pps the 3.3 V motors manage).
+   The motors are unpowered at standstill (IHOLD 0) and the lens groups stay
+   put mechanically, so the last resting position stays valid across a power
+   cycle. Flash sector 61 (0x0C07A000, reserved by the linker script) is an
+   append-only log of 16-byte records:
+     MOVE  - written before any motion starts (axis_start, zero)
+     IDLE  - zoom/focus position, written once both axes are idle, referenced
+             and no sequence is running
+   At boot a last record of IDLE restores both positions as referenced; a
+   last record of MOVE (power lost mid-move), a blank or corrupt log, or a
+   hand-moved lens (cannot be detected) -> full homing / "lens rehome".
+   Erase only at rest, when fewer than 2 free slots remain (512 slots ->
+   one erase per ~255 moves). */
+#define PL_SECTOR   61u
+#define PL_IDLE     0x454C4449u      /* "IDLE" */
+#define PL_MOVE     0x45564F4Du      /* "MOVE" */
+#define PL_SLOTS    (FLASH_SECTOR_SIZE / 16u)
+typedef struct { uint32_t tag; int32_t z, f; uint32_t chk; } PosRec_t;
+static int     s_pl_next = -1;       /* next free slot, -1 = not scanned */
+static uint8_t s_pl_state;           /* 0 = nothing logged, 1 = IDLE last, 2 = MOVE last */
+static bool    s_pl_enabled;         /* off until boot decided (no logging of boot homing glitches) */
+
+static uint32_t pl_addr(void) { return FLASH_BASE + PL_SECTOR * FLASH_SECTOR_SIZE; }   /* 0x0C07A000 */
+static uint32_t pl_chk(const PosRec_t *r) { return ~(r->tag ^ (uint32_t)r->z ^ ((uint32_t)r->f << 1) ^ 0x5A5A1234u); }
+
+static void pl_scan(PosRec_t *last)
+{
+  const PosRec_t *r = (const PosRec_t *)pl_addr();
+  int n = 0;
+  memset(last, 0, sizeof *last);
+  while (n < (int)PL_SLOTS && r[n].tag != 0xFFFFFFFFu) {
+    if (r[n].chk == pl_chk(&r[n])) *last = r[n];
+    n++;
+  }
+  s_pl_next = n;
+}
+
+static bool pl_flash(bool erase, const PosRec_t *rec)
+{
+  static PosRec_t q __attribute__((aligned(16)));
+  bool ok = true;
+  bool icache_on = (ICACHE->CR & ICACHE_CR_EN) != 0u;
+  if (icache_on) HAL_ICACHE_Disable();
+  HAL_FLASH_Unlock();
+  FLASH->NSCCR = FLASH->NSSR & 0x00FF0000u;
+  if (erase) {
+    FLASH_EraseInitTypeDef e = { .TypeErase = FLASH_TYPEERASE_SECTORS_NS, .Banks = FLASH_BANK_1,
+                                 .Sector = PL_SECTOR, .NbSectors = 1 };
+    uint32_t serr = 0;
+    ok = HAL_FLASHEx_Erase(&e, &serr) == HAL_OK;
+    if (ok) s_pl_next = 0;
+  }
+  if (ok && rec) {
+    q = *rec;
+    ok = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD_NS, pl_addr() + 16u * (uint32_t)s_pl_next, (uint32_t)&q) == HAL_OK;
+    if (ok) s_pl_next++;
+  }
+  HAL_FLASH_Lock();
+  if (icache_on) { HAL_ICACHE_Invalidate(); HAL_ICACHE_Enable(); }
+  return ok;
+}
+
+static void pl_append(uint32_t tag, int32_t z, int32_t f, bool may_erase)
+{
+  if (s_pl_next < 0) { PosRec_t d; pl_scan(&d); }
+  bool erase = false;
+  if (s_pl_next >= (int)PL_SLOTS - (may_erase ? 1 : 0)) {
+    if (!may_erase) return;            /* never erase while a motor runs */
+    erase = true;
+  }
+  PosRec_t r = { tag, z, f, 0 };
+  r.chk = pl_chk(&r);
+  if (pl_flash(erase || s_pl_next >= (int)PL_SLOTS, &r)) s_pl_state = (tag == PL_IDLE) ? 1 : 2;
+}
+
+static void poslog_moving(void)
+{
+  if (!s_pl_enabled || s_pl_state == 2) return;
+  pl_append(PL_MOVE, 0, 0, false);
+  s_pl_state = 2;                      /* even if the write failed: re-log IDLE later */
+}
+
+static bool all_idle(void);
+static void poslog_task(void)
+{
+  if (!s_pl_enabled || s_pl_state != 2) return;
+  if (!all_idle() || seq_active()) return;
+  const Axis_t *z = &s_ax[LENS_ZOOM], *f = &s_ax[LENS_FOCUS];
+  if (!z->referenced || !f->referenced) return;   /* stays MOVE: next boot homes */
+  bool erase_now = s_pl_next >= (int)PL_SLOTS - 2;
+  if (erase_now) pl_flash(true, NULL);
+  pl_append(PL_IDLE, z->pos, f->pos, true);
+}
+
+/* Restore the logged resting position. true = both axes referenced again. */
+static bool poslog_restore(int32_t *zp, int32_t *fp)
+{
+  PosRec_t last;
+  pl_scan(&last);
+  if (last.tag != PL_IDLE) return false;
+  if (last.z < 0 || last.z > 40000 || last.f < 0 || last.f > 40000) return false;
+  Axis_t *z = &s_ax[LENS_ZOOM], *f = &s_ax[LENS_FOCUS];
+  z->pos = last.z; z->referenced = true; z->limits_on = true; apply_limits(z);
+  f->pos = last.f; f->referenced = true; f->limits_on = true; apply_limits(f);
+  s_pl_state = 1;
+  *zp = last.z; *fp = last.f;
+  return true;
+}
 
 /* ============================================= lookup table in flash ===== */
 /* Zoom/focus level lookup table kept in flash bank 1 sector 62 (0x0C07C000,
@@ -876,14 +992,28 @@ void LENS_Init(LensPrintFn print)
   print_status(print);
 
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
-  if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) {
+  int32_t rz, rf;
+  if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured && poslog_restore(&rz, &rf)) {
+    /* Fast boot: position known from the log -> direct moves to level 0
+       (nothing to do if the lens rested at level 0). */
+    s_pl_enabled = true;
+    bool at = rz == s_levels[BOOT_LEVEL].zoom && rf == level_focus(BOOT_LEVEL);
+    if (!at) seq_plan(s_levels[BOOT_LEVEL].zoom, level_focus(BOOT_LEVEL), false);
+    s_level = BOOT_LEVEL; s_level_busy = true;
+    s_boot = 1;
+    snprintf(s_buf, sizeof s_buf, "[LENS] boot: position restored (zoom %ld focus %ld), %s - no homing (\"lens rehome\" to re-reference)\r\n",
+             (long)rz, (long)rf, at ? "already at level 0" : "direct move to level 0");
+    print(s_buf);
+  } else if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) {
     /* One motor at a time; each axis is homed twice: the first sequence
        after an MCU reset landed zoom a few thousand steps short (level 0
        blurred), the same moves run later were fine (2026-11-17). */
+    s_pl_enabled = true;
+    poslog_moving();
     seq_plan(s_levels[BOOT_LEVEL].zoom, level_focus(BOOT_LEVEL), true);
     s_level = BOOT_LEVEL; s_level_busy = true;
     s_boot = 1;
-    print("[LENS] boot: focus home + 10000, zoom home + level 0, focus home + level 0 (~2 min)\r\n");
+    print("[LENS] boot: no valid saved position - focus home + 10000, zoom home + level 0, focus home + level 0 (~2 min)\r\n");
   } else {
     print("[LENS] boot homing not started: driver not configured\r\n");
   }
