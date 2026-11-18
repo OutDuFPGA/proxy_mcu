@@ -347,6 +347,7 @@ static const char *s_lut_src = "built-in";
 #define LENS_BOOT_SETTLE_MS   1000    /* driver power-up settle before the first UART config */
 #define LENS_BOOT_CFG_TRIES   10      /* config attempts at boot ... */
 #define LENS_BOOT_CFG_GAP_MS  200     /* ... this far apart */
+#define LENS_TMC_BAUD         115200u /* TMC2300 UART (see LENS_Init) */
 #define FOCUS_TRAVEL_DEFAULT  32400   /* forward soft limit after homing */
 #define BACKLASH_PRE       1000       /* moves down go this far below, then up (both axes) */
 static int8_t  s_level = -1;          /* current level, -1 = none / moved by hand */
@@ -830,6 +831,16 @@ void LENS_Init(LensPrintFn print)
      LENS_BOOT_SETTLE_MS, then retry the config until both are configured. */
   HAL_Delay(LENS_BOOT_SETTLE_MS);
 
+  /* TMC UART baud: 115200, not CubeMX's 9600. 9600 is at the bottom of the
+     TMC2300 auto-baud range (min 9000 baud at max internal clock, datasheet
+     rev 1.09 4.1). After a cold power-up, or a glitch such as toggling EN,
+     the drivers stayed deaf to 9600 (USART1 framing errors, "lens init"
+     failing for 10+ minutes, MCU resets did not help); switching to 115200
+     made the same stuck drivers answer at once (2026-11-18). */
+  HAL_UART_Abort(&huart1);
+  huart1.Init.BaudRate = LENS_TMC_BAUD;
+  HAL_HalfDuplex_Init(&huart1);
+
   int tries = 0;
   for (; tries < LENS_BOOT_CFG_TRIES; tries++) {
     if (tries) HAL_Delay(LENS_BOOT_CFG_GAP_MS);
@@ -858,29 +869,11 @@ void LENS_Init(LensPrintFn print)
     print(s_buf);
   }
   s_ax[LENS_ZOOM].travel = s_zoom_far - 500;
-  snprintf(s_buf, sizeof s_buf, "[LENS] driver config: %s after %d attempt(s), %d ms settle\r\n",
+  snprintf(s_buf, sizeof s_buf, "[LENS] driver config: %s after %d attempt(s), %d ms settle, %lu baud\r\n",
            (u1->configured && u2->configured) ? "ok" : "FAILED",
-           tries < LENS_BOOT_CFG_TRIES ? tries + 1 : tries, LENS_BOOT_SETTLE_MS);
+           tries < LENS_BOOT_CFG_TRIES ? tries + 1 : tries, LENS_BOOT_SETTLE_MS, (unsigned long)huart1.Init.BaudRate);
   print(s_buf);
   print_status(print);
-
-  /* 2026-11-18: after a cold power cycle the TMC2300 UART can stay dead
-     (USART1 framing errors) through every retry and "lens init", while an
-     MCU reset always fixed it. So if the drivers did not configure and the
-     last reset was not already a software reset, reset the MCU once. The
-     reset flags are cleared before the reset, so the check after it sees
-     only the software reset; a second failure is reported, not looped. */
-  uint32_t rsr = RCC->RSR;
-  if (!(s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured)) {
-    if (!(rsr & RCC_RSR_SFTRSTF)) {
-      print("[LENS] driver config failed after power-up: resetting the MCU once\r\n");
-      HAL_Delay(20);                     /* let the console drain */
-      RCC->RSR |= RCC_RSR_RMVF;
-      NVIC_SystemReset();
-    }
-    print("[LENS] driver config failed again after the software reset\r\n");
-  }
-  RCC->RSR |= RCC_RSR_RMVF;            /* next reset reports its own cause */
 
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
   if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) {
@@ -1138,6 +1131,16 @@ bool LENS_CLI(const char *cmd, LensPrintFn print)
   if (!strcmp(tok[1], "rehome")) {
     print(rehome_go() ? "OK re-homing both axes (~80 s), then back to the level\r\n" : "ERROR: busy\r\n");
     return true;
+  }
+  if (!strcmp(tok[1], "baud")) {              /* TMC UART baud rate (USART1, half duplex) */
+    long v;
+    if (nt >= 3 && parse_long(tok[2], &v) && v >= 9600 && v <= 500000) {
+      HAL_UART_Abort(&huart1);
+      huart1.Init.BaudRate = (uint32_t)v;
+      bool ok = HAL_HalfDuplex_Init(&huart1) == HAL_OK;
+      snprintf(s_buf, sizeof s_buf, ok ? "OK TMC UART %ld baud (\"lens init\" to re-config)\r\n" : "ERROR: UART init at %ld\r\n", v);
+    } else snprintf(s_buf, sizeof s_buf, "TMC UART %lu baud - lens baud <9600..500000>\r\n", (unsigned long)huart1.Init.BaudRate);
+    print(s_buf); return true;
   }
   if (!strcmp(tok[1], "lut")) {               /* level lookup table in flash */
     long n, z, f, v;
