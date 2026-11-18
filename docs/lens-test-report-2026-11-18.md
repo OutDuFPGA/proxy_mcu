@@ -64,6 +64,15 @@ gave no clear gain (<3 %), so the zoom steps were kept.
 | L1 (MCU reset) | direct move | 16 s | 100 % |
 | empty log (first boot) | full homing | 122 s | – |
 
+### Rejected options (tested 20:12–20:34, not in the firmware)
+Both compared with a 150 pps one-motor-at-a-time reference pass over the same 22 level
+changes (single steps down and up, then jumps 0→3, 3→5, 5→0, 0→2, 2→4, 4→1, 1→0).
+
+| Option | Result | Verdict |
+|---|---|---|
+| 250 pps (100/250/600) | upward moves 94–121 %; downward moves lose steps: L4→L3 79/81 %, L2→L1 78/81 %, L3→L2 85 %, L4→L1 81 %; 4–15 s per change | stay at 150 pps |
+| Zoom + focus together, focus following zoom (longer path at 150 pps, shorter one scaled so both finish together) | first move L5→L4 6 %, then 0–2 % on every move (errors accumulate); re-home restored L0 to 101 % | not usable on the 3.3 V motor supply – same finding as 2026-11-17 |
+
 ## Known limits / open points
 - From a level other than L0 the boot takes 16–29 s: moves run at 150 pps, the limit on the
   3.3 V motor supply. A 5 V supply would allow faster moves.
