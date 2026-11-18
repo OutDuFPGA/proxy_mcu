@@ -674,8 +674,13 @@ static void print_status(LensPrintFn print);
 
 /* ============================================= lookup table in flash ===== */
 /* Zoom/focus level lookup table kept in flash bank 1 sector 62 (0x0C07C000,
-   secure; the linker script reserves it: FLASH = 496 KB). Sector 63 is
-   FLASH_NSC (secure-gateway veneers) - never touch it. Programming the
+   the linker script reserves it: FLASH = 496 KB). Sector 63 is FLASH_NSC
+   (secure-gateway veneers) - never touch it.
+   TrustZone is DISABLED on this chip (OPTSR2 TZEN = 0xC3; DAUTHSTATUS has no
+   secure debug; the core runs non-secure). The HAL is built with -mcmse, so
+   its plain erase/program types drive the secure SECCR register, which does
+   not exist here (RAZ/WI): the data write then fails with PGSERR in NSSR.
+   Always use the *_NS operation types (NSCR). Programming the
    firmware ELF does not erase sector 62, so the table survives reflashing.
    Loaded at boot (CRC-checked); if the sector holds no valid table, the
    built-in defaults are written to it. Changed only by "lens lut save" /
@@ -726,10 +731,6 @@ static const char *lut_save(void)
 {
   for (int i = 0; i < LENS_NAXIS; i++) if (s_ax[i].running) return "axis moving";
   if (seq_active()) return "level change running";
-  uint32_t wm = FLASH->SECWM1R_CUR;
-  uint32_t st = (wm & FLASH_SECWMR_SECWM_STRT_Msk) >> FLASH_SECWMR_SECWM_STRT_Pos;
-  uint32_t en = (wm & FLASH_SECWMR_SECWM_END_Msk) >> FLASH_SECWMR_SECWM_END_Pos;
-  if (st > LUT_SECTOR || en < LUT_SECTOR) return "LUT sector is not in the secure flash area";
 
   static LensLut_t t __attribute__((aligned(16)));
   memset(&t, 0, sizeof t);
@@ -739,7 +740,7 @@ static const char *lut_save(void)
   }
   t.crc = crc32(&t, offsetof(LensLut_t, crc));
 
-  FLASH_EraseInitTypeDef e = { .TypeErase = FLASH_TYPEERASE_SECTORS, .Banks = FLASH_BANK_1,
+  FLASH_EraseInitTypeDef e = { .TypeErase = FLASH_TYPEERASE_SECTORS_NS, .Banks = FLASH_BANK_1,
                                .Sector = LUT_SECTOR, .NbSectors = 1 };
   uint32_t serr = 0;
   const char *res = NULL;
@@ -749,23 +750,24 @@ static const char *lut_save(void)
   bool icache_on = (ICACHE->CR & ICACHE_CR_EN) != 0u;
   if (icache_on) HAL_ICACHE_Disable();
   HAL_FLASH_Unlock();
+  FLASH->NSCCR = FLASH->NSSR & 0x00FF0000u;   /* clear stale error flags (e.g. left by the debugger) */
   if (HAL_FLASHEx_Erase(&e, &serr) != HAL_OK) {
     snprintf(why, sizeof why, "erase failed (err 0x%lX)", (unsigned long)HAL_FLASH_GetError()); res = why;
   }
   for (uint32_t off = 0; !res && off < sizeof t; off += 16u)
-    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, lut_addr() + off, (uint32_t)((uint8_t *)&t + off)) != HAL_OK) {
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD_NS, lut_addr() + off, (uint32_t)((uint8_t *)&t + off)) != HAL_OK) {
       snprintf(why, sizeof why, "program failed at 0x%08lX (err 0x%lX)", (unsigned long)(lut_addr() + off),
                (unsigned long)HAL_FLASH_GetError());
       res = why;
     }
-  uint32_t sr = FLASH->SECSR, nsr = FLASH->NSSR, cr = FLASH->SECCR, err = HAL_FLASH_GetError();
+  uint32_t nsr = FLASH->NSSR, cr = FLASH->NSCR, err = HAL_FLASH_GetError();
   HAL_FLASH_Lock();
   if (icache_on) { HAL_ICACHE_Invalidate(); HAL_ICACHE_Enable(); }
   if (!res) {
     const uint32_t *f = (const uint32_t *)lut_addr(), *r = (const uint32_t *)&t;
     for (uint32_t k = 0; k < sizeof t / 4u; k++) if (f[k] != r[k]) {
-      snprintf(why, sizeof why, "verify failed @+%lu: %08lX want %08lX (SECSR %08lX NSSR %08lX SECCR %08lX err %lX)",
-               (unsigned long)(4u * k), (unsigned long)f[k], (unsigned long)r[k], (unsigned long)sr,
+      snprintf(why, sizeof why, "verify failed @+%lu: %08lX want %08lX (NSSR %08lX NSCR %08lX err %lX)",
+               (unsigned long)(4u * k), (unsigned long)f[k], (unsigned long)r[k],
                (unsigned long)nsr, (unsigned long)cr, (unsigned long)err);
       res = why; break;
     }
@@ -861,6 +863,24 @@ void LENS_Init(LensPrintFn print)
            tries < LENS_BOOT_CFG_TRIES ? tries + 1 : tries, LENS_BOOT_SETTLE_MS);
   print(s_buf);
   print_status(print);
+
+  /* 2026-11-18: after a cold power cycle the TMC2300 UART can stay dead
+     (USART1 framing errors) through every retry and "lens init", while an
+     MCU reset always fixed it. So if the drivers did not configure and the
+     last reset was not already a software reset, reset the MCU once. The
+     reset flags are cleared before the reset, so the check after it sees
+     only the software reset; a second failure is reported, not looped. */
+  uint32_t rsr = RCC->RSR;
+  if (!(s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured)) {
+    if (!(rsr & RCC_RSR_SFTRSTF)) {
+      print("[LENS] driver config failed after power-up: resetting the MCU once\r\n");
+      HAL_Delay(20);                     /* let the console drain */
+      RCC->RSR |= RCC_RSR_RMVF;
+      NVIC_SystemReset();
+    }
+    print("[LENS] driver config failed again after the software reset\r\n");
+  }
+  RCC->RSR |= RCC_RSR_RMVF;            /* next reset reports its own cause */
 
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
   if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) {
