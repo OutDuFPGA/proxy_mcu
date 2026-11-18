@@ -28,9 +28,9 @@
   },
   "stages": [
     {
-      "name": "Zoom0 (homed: lens z 0, lens f 9854)",
-      "zoom": 52000,
-      "focus": 4400
+      "name": "L0 (2026-11-18 cal: zoom far stop 34250 - 500)",
+      "zoom": 33750,
+      "focus": 28100
     },
     {
       "name": "Stage 2",

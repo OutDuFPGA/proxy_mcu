@@ -29,6 +29,8 @@
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
+#include <stddef.h>
+#include <arm_cmse.h>
 
 /* ------------------------------------------------------ TMC2300 registers */
 #define R_GSTAT       0x01
@@ -308,7 +310,14 @@ static bool can_move(LensAxis_t ax)
      500 steps; each level = home + coarse 1000 + fine 100, then checked by
      going back and by a full repeat with zoom re-homed (all within 3 %).
      level  zoom   focus_msp  focus_cal  sharpness (back / full repeat)
-       0   32750    25600      27000     20582 (20409 / 19943)  stop - 500
+       0   33750    25600      28100     48000 (41433 / 40413)  stop - 500
+         (L0 re-calibrated 2026-11-18 15:18: far stop 34250, was 33250 /
+          32750 / 27000; power-cycle test 42775, peak flat 28000..28300.
+          L1..L5 focus re-tuned 2026-11-18 16:45 at the same zoom steps:
+          16600/11000/7200/4400/2300 -> 15450/10300/6700/4100/2000, sharpness
+          2747/4789/7920/13933/28990 -> 53829/52480/49472/49788/54697.
+          Zoom +-250/+-500 with focus re-tuned gave no clear gain (<3 %),
+          so the zoom steps stay.)
        1   29250    20800      16600     23206 (23254 / 23811)
        2   25250    14200      11000     28199 (27842 / 27350)
        3   21250     9200       7200     31287 (31109 / 30595)
@@ -318,14 +327,26 @@ static bool can_move(LensAxis_t ax)
    only used through the table. Focus 0 = its real reverse stop (home at
    100 pps; 300 pps stalls 800..1600 short). Long moves down lose steps, so a
    level change re-homes any axis that has to move down, then comes up. */
-typedef struct { int32_t zoom, focus_msp, focus_cal; } Level_t;
-static const Level_t s_levels[] = {
-  { 32750, 25600, 27000 }, { 29250, 20800, 16600 }, { 25250, 14200, 11000 },
-  { 21250,  9200,  7200 }, { 17250,  5400,  4400 }, { 13250,  1600,  2300 },
+typedef struct { int32_t zoom, focus_msp, focus_cal; uint32_t sharp; } Level_t;
+/* Built-in lookup table (calibrated 2026-11-18). "sharp" = centre-1/3 Sobel
+   energy measured at that step on the bench (focus chart scene, 960x540
+   RTSP frames) - a reference for later checks, not used for motion.
+   The live table (s_levels) is loaded from flash at boot (see "lookup table
+   in flash" below); these values seed the flash when it holds no valid table. */
+static const Level_t s_levels_def[] = {
+  { 33750, 25600, 28100, 43225 }, { 29250, 20800, 15450, 53829 }, { 25250, 14200, 10300, 52480 },
+  { 21250,  9200,  6700, 49472 }, { 17250,  5400,  4100, 49788 }, { 13250,  1600,  2000, 54697 },
 };
-#define NLEVELS            ((int)(sizeof s_levels / sizeof s_levels[0]))
+#define NLEVELS            ((int)(sizeof s_levels_def / sizeof s_levels_def[0]))
+#define ZOOM_FAR_STOP_DEF  34250      /* zoom far stop found 2026-11-18 (image-change scan) */
+static Level_t  s_levels[NLEVELS];    /* live table: copy of the flash LUT (or the defaults) */
+static int32_t  s_zoom_far = ZOOM_FAR_STOP_DEF;
+static const char *s_lut_src = "built-in";
 #define BOOT_LEVEL         0
-#define ZOOM_TRAVEL        32750      /* 500 short of the far stop (33250) */
+#define ZOOM_TRAVEL        33750      /* 500 short of the far stop (34250, 2026-11-18) */
+#define LENS_BOOT_SETTLE_MS   1000    /* driver power-up settle before the first UART config */
+#define LENS_BOOT_CFG_TRIES   10      /* config attempts at boot ... */
+#define LENS_BOOT_CFG_GAP_MS  200     /* ... this far apart */
 #define FOCUS_TRAVEL_DEFAULT  32400   /* forward soft limit after homing */
 #define BACKLASH_PRE       1000       /* moves down go this far below, then up (both axes) */
 static int8_t  s_level = -1;          /* current level, -1 = none / moved by hand */
@@ -651,6 +672,120 @@ static void axis_hw(Axis_t *a, const char *drv, TIM_HandleTypeDef *h, uint32_t c
 
 static void print_status(LensPrintFn print);
 
+/* ============================================= lookup table in flash ===== */
+/* Zoom/focus level lookup table kept in flash bank 1 sector 62 (0x0C07C000,
+   secure; the linker script reserves it: FLASH = 496 KB). Sector 63 is
+   FLASH_NSC (secure-gateway veneers) - never touch it. Programming the
+   firmware ELF does not erase sector 62, so the table survives reflashing.
+   Loaded at boot (CRC-checked); if the sector holds no valid table, the
+   built-in defaults are written to it. Changed only by "lens lut save" /
+   "lens lut default" with both axes idle (erase stalls bank-1 code fetch
+   for a few ms). */
+#define LUT_SECTOR  62u
+#define LUT_MAGIC   0x54554C4Cu      /* "LLUT" */
+#define LUT_VER     1u
+typedef struct {
+  uint32_t magic, ver, size, nlevels;
+  int32_t  zoom_far;
+  struct { int32_t zoom, focus; uint32_t sharp; } lv[NLEVELS];
+  uint32_t crc;
+} LensLut_t;
+
+static uint32_t crc32(const void *d, size_t n)
+{
+  const uint8_t *p = d; uint32_t c = 0xFFFFFFFFu;
+  while (n--) { c ^= *p++; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u))); }
+  return ~c;
+}
+
+static uint32_t lut_addr(void) { return FLASH_BASE + LUT_SECTOR * FLASH_SECTOR_SIZE; }   /* 0x0C07C000 */
+
+static void lut_defaults(void)
+{
+  memcpy(s_levels, s_levels_def, sizeof s_levels);
+  s_zoom_far = ZOOM_FAR_STOP_DEF;
+}
+
+static bool lut_load(void)
+{
+  const LensLut_t *t = (const LensLut_t *)lut_addr();
+  if (t->magic != LUT_MAGIC || t->ver != LUT_VER || t->size != sizeof *t || t->nlevels != NLEVELS) return false;
+  if (crc32(t, offsetof(LensLut_t, crc)) != t->crc) return false;
+  for (int i = 0; i < NLEVELS; i++) {
+    if (t->lv[i].zoom < 0 || t->lv[i].zoom > 40000 || t->lv[i].focus < 0 || t->lv[i].focus > 40000) return false;
+  }
+  for (int i = 0; i < NLEVELS; i++) {
+    s_levels[i].zoom = t->lv[i].zoom; s_levels[i].focus_cal = t->lv[i].focus;
+    s_levels[i].sharp = t->lv[i].sharp; s_levels[i].focus_msp = s_levels_def[i].focus_msp;
+  }
+  s_zoom_far = t->zoom_far;
+  return true;
+}
+
+static const char *lut_save(void)
+{
+  for (int i = 0; i < LENS_NAXIS; i++) if (s_ax[i].running) return "axis moving";
+  if (seq_active()) return "level change running";
+  uint32_t wm = FLASH->SECWM1R_CUR;
+  uint32_t st = (wm & FLASH_SECWMR_SECWM_STRT_Msk) >> FLASH_SECWMR_SECWM_STRT_Pos;
+  uint32_t en = (wm & FLASH_SECWMR_SECWM_END_Msk) >> FLASH_SECWMR_SECWM_END_Pos;
+  if (st > LUT_SECTOR || en < LUT_SECTOR) return "LUT sector is not in the secure flash area";
+
+  static LensLut_t t __attribute__((aligned(16)));
+  memset(&t, 0, sizeof t);
+  t.magic = LUT_MAGIC; t.ver = LUT_VER; t.size = sizeof t; t.nlevels = NLEVELS; t.zoom_far = s_zoom_far;
+  for (int i = 0; i < NLEVELS; i++) {
+    t.lv[i].zoom = s_levels[i].zoom; t.lv[i].focus = s_levels[i].focus_cal; t.lv[i].sharp = s_levels[i].sharp;
+  }
+  t.crc = crc32(&t, offsetof(LensLut_t, crc));
+
+  FLASH_EraseInitTypeDef e = { .TypeErase = FLASH_TYPEERASE_SECTORS, .Banks = FLASH_BANK_1,
+                               .Sector = LUT_SECTOR, .NbSectors = 1 };
+  uint32_t serr = 0;
+  const char *res = NULL;
+  static char why[144];
+  /* ICACHE caches the flash code region: program/erase with it disabled,
+     invalidate afterwards (RM0481 ICACHE / FLASH programming notes). */
+  bool icache_on = (ICACHE->CR & ICACHE_CR_EN) != 0u;
+  if (icache_on) HAL_ICACHE_Disable();
+  HAL_FLASH_Unlock();
+  if (HAL_FLASHEx_Erase(&e, &serr) != HAL_OK) {
+    snprintf(why, sizeof why, "erase failed (err 0x%lX)", (unsigned long)HAL_FLASH_GetError()); res = why;
+  }
+  for (uint32_t off = 0; !res && off < sizeof t; off += 16u)
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, lut_addr() + off, (uint32_t)((uint8_t *)&t + off)) != HAL_OK) {
+      snprintf(why, sizeof why, "program failed at 0x%08lX (err 0x%lX)", (unsigned long)(lut_addr() + off),
+               (unsigned long)HAL_FLASH_GetError());
+      res = why;
+    }
+  uint32_t sr = FLASH->SECSR, nsr = FLASH->NSSR, cr = FLASH->SECCR, err = HAL_FLASH_GetError();
+  HAL_FLASH_Lock();
+  if (icache_on) { HAL_ICACHE_Invalidate(); HAL_ICACHE_Enable(); }
+  if (!res) {
+    const uint32_t *f = (const uint32_t *)lut_addr(), *r = (const uint32_t *)&t;
+    for (uint32_t k = 0; k < sizeof t / 4u; k++) if (f[k] != r[k]) {
+      snprintf(why, sizeof why, "verify failed @+%lu: %08lX want %08lX (SECSR %08lX NSSR %08lX SECCR %08lX err %lX)",
+               (unsigned long)(4u * k), (unsigned long)f[k], (unsigned long)r[k], (unsigned long)sr,
+               (unsigned long)nsr, (unsigned long)cr, (unsigned long)err);
+      res = why; break;
+    }
+  }
+  if (!res) s_lut_src = "flash";
+  return res;
+}
+
+static void lut_print(LensPrintFn print)
+{
+  snprintf(s_buf, sizeof s_buf, "lookup table (%s @0x%08lX), zoom far stop %ld\r\n  lvl   zoom  focus  sharpness\r\n",
+           s_lut_src, (unsigned long)lut_addr(), (long)s_zoom_far);
+  print(s_buf);
+  for (int i = 0; i < NLEVELS; i++) {
+    snprintf(s_buf, sizeof s_buf, "  %d%s %6ld %6ld %10lu\r\n", i, i == s_level ? "*" : " ", (long)s_levels[i].zoom,
+             (long)s_levels[i].focus_cal, (unsigned long)s_levels[i].sharp);
+    print(s_buf);
+  }
+}
+
 void LENS_Init(LensPrintFn print)
 {
   GPIO_InitTypeDef g = {0};
@@ -670,6 +805,15 @@ void LENS_Init(LensPrintFn print)
   /* Values tuned on the bench before the rewrite (2026-11-17). */
   Axis_t *zm = &s_ax[LENS_ZOOM], *fm = &s_ax[LENS_FOCUS];
   /* 2026-11-17 ~11:30: speeds used for the sharp-position calibration. */
+  /* Level-move speed, tested 2026-11-17 on 3.3 V (12 level changes each,
+     all levels >= 90 % of calibrated sharpness to pass): 100/200/500 pass,
+     150/200/700 pass, 100/250/600 pass (99-110 %, mean 8.8 s per change),
+     200/300/1000 FAIL (lost steps on every upward move). 250 is the
+     fastest passing setting; little margin on 3.3 V - a 5 V motor supply
+     (IRUN ~25) is the way to go faster. Homing speeds stay slow.
+     2026-11-17 18:46 re-check: at 250/600 level 0 came out at 5 % sharpness
+     and a re-home made it worse (0.5 %); back at 150/500 every level is at
+     its focus peak again -> keep the calibration speed 150. */
   zm->start_pps = 100; zm->max_pps = 150; zm->acc_pps2 = 500;
   zm->home_pps = 150;  zm->home_fs = 4500; zm->home_dir = -1; zm->travel = ZOOM_TRAVEL; /* reverse stop, <=30 s */
   fm->start_pps = 100; fm->max_pps = 150; fm->acc_pps2 = 500;
@@ -678,21 +822,44 @@ void LENS_Init(LensPrintFn print)
   HAL_GPIO_WritePin(u1->en_port, u1->en_pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(u2->en_port, u2->en_pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(u5->en_port, u5->en_pin, GPIO_PIN_RESET);
-  HAL_Delay(50);
+  /* 2026-11-18: after a power cycle one driver at a time missed its config
+     (zoom NOCFG once, focus NO-UART once); "lens init" later always worked.
+     The TMC2300s need time after power-up before they answer, so wait
+     LENS_BOOT_SETTLE_MS, then retry the config until both are configured. */
+  HAL_Delay(LENS_BOOT_SETTLE_MS);
 
-  uint8_t sync = 0;                    /* first byte lets the TMC auto-baud lock */
-  HAL_UART_Abort(&huart1);
-  HAL_HalfDuplex_EnableTransmitter(&huart1);
-  HAL_UART_Transmit(&huart1, &sync, 1, 10);
-  HAL_Delay(2);
-
-  drv_config(u1);
-  drv_config(u2);
+  int tries = 0;
+  for (; tries < LENS_BOOT_CFG_TRIES; tries++) {
+    if (tries) HAL_Delay(LENS_BOOT_CFG_GAP_MS);
+    uint8_t sync = 0;                  /* first byte lets the TMC auto-baud lock */
+    HAL_UART_Abort(&huart1);
+    HAL_HalfDuplex_EnableTransmitter(&huart1);
+    HAL_UART_Transmit(&huart1, &sync, 1, 10);
+    HAL_Delay(2);
+    if (!u1->configured) drv_config(u1);
+    if (!u2->configured) drv_config(u2);
+    if (u1->configured && u2->configured) break;
+  }
   timer_init(u1);
   timer_init(u2);
   timer_init(u5);
 
   print("\r\n[LENS] lens control (rewrite 2026-11-17) - \"lens help\"\r\n");
+  if (lut_load()) {
+    s_lut_src = "flash";
+    print("[LENS] lookup table loaded from flash\r\n");
+  } else {
+    lut_defaults();
+    const char *e = lut_save();
+    snprintf(s_buf, sizeof s_buf, "[LENS] no valid lookup table in flash: built-in table %s%s\r\n",
+             e ? "in use, flash write FAILED: " : "written to flash", e ? e : "");
+    print(s_buf);
+  }
+  s_ax[LENS_ZOOM].travel = s_zoom_far - 500;
+  snprintf(s_buf, sizeof s_buf, "[LENS] driver config: %s after %d attempt(s), %d ms settle\r\n",
+           (u1->configured && u2->configured) ? "ok" : "FAILED",
+           tries < LENS_BOOT_CFG_TRIES ? tries + 1 : tries, LENS_BOOT_SETTLE_MS);
+  print(s_buf);
   print_status(print);
 
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
@@ -790,6 +957,9 @@ static void print_help(LensPrintFn print)
   print("  lens <ax> reg <r> [val]          raw TMC2300 register read/write\r\n");
   print("  lens level [n] | zoomin | zoomout  zoom level 0..5 (MSP430 table) with its focus\r\n");
   print("  lens table cal|msp               focus column: this camera's / MSP430 values\r\n");
+  print("  lens lut                         level lookup table (zoom, focus, sharpness) in flash\r\n");
+  print("  lens lut set <n> <z> <f> [sharp] | here <n> [sharp] | far <usteps>   edit in RAM\r\n");
+  print("  lens lut save | load | default   write to / reload from flash, built-in values\r\n");
   print("  lens rehome                      re-reference both axes, return to the level\r\n");
   print("  lens f best                      focus back to the current level's focus\r\n");
   print("  zoom_run|focus_run <dir> <step_hz>, zoom_stop|focus_stop   old jog commands\r\n");
@@ -947,6 +1117,65 @@ bool LENS_CLI(const char *cmd, LensPrintFn print)
   }
   if (!strcmp(tok[1], "rehome")) {
     print(rehome_go() ? "OK re-homing both axes (~80 s), then back to the level\r\n" : "ERROR: busy\r\n");
+    return true;
+  }
+  if (!strcmp(tok[1], "lut")) {               /* level lookup table in flash */
+    long n, z, f, v;
+    if (nt < 3) { lut_print(print); return true; }
+    if (!strcmp(tok[2], "save")) {
+      const char *e = lut_save();
+      if (e) snprintf(s_buf, sizeof s_buf, "ERROR: LUT save: %s\r\n", e);
+      else snprintf(s_buf, sizeof s_buf, "OK lookup table saved to flash @0x%08lX\r\n", (unsigned long)lut_addr());
+      print(s_buf); return true;
+    }
+    if (!strcmp(tok[2], "diag")) {
+      uint32_t c0 = FLASH->SECCR, n0 = FLASH->NSCR;
+      HAL_StatusTypeDef u = HAL_FLASH_Unlock();
+      uint32_t c1 = FLASH->SECCR, n1 = FLASH->NSCR;
+      HAL_FLASH_Lock();
+      uint32_t c2 = FLASH->SECCR;
+      snprintf(s_buf, sizeof s_buf, "SECCR %08lX->unlock(%d) %08lX->lock %08lX  NSCR %08lX->%08lX\r\n",
+               (unsigned long)c0, (int)u, (unsigned long)c1, (unsigned long)c2, (unsigned long)n0, (unsigned long)n1);
+      print(s_buf);
+      snprintf(s_buf, sizeof s_buf, "CONTROL %08lX PRIVCFGR %08lX SECWM1R %08lX SECBB1R2 %08lX OPTSR2 %08lX SECSR %08lX\r\n",
+               (unsigned long)__get_CONTROL(), (unsigned long)FLASH->PRIVCFGR, (unsigned long)FLASH->SECWM1R_CUR,
+               (unsigned long)FLASH->SECBB1R2, (unsigned long)FLASH->OPTSR2_CUR, (unsigned long)FLASH->SECSR);
+      print(s_buf);
+      cmse_address_info_t r1 = cmse_TT((void *)&FLASH->SECCR), r2 = cmse_TT((void *)lut_addr()), r3 = cmse_TT((void *)&lut_save);
+      snprintf(s_buf, sizeof s_buf, "SAU CTRL %08lX  TT SECCR %08lX  TT LUT %08lX  TT code %08lX\r\n",
+               (unsigned long)SAU->CTRL, (unsigned long)r1.value, (unsigned long)r2.value, (unsigned long)r3.value);
+      print(s_buf); return true;
+    }
+    if (!strcmp(tok[2], "load")) {
+      print(lut_load() ? (s_lut_src = "flash", "OK lookup table reloaded from flash\r\n")
+                       : "ERROR: no valid lookup table in flash\r\n");
+      return true;
+    }
+    if (!strcmp(tok[2], "default")) {
+      lut_defaults(); s_lut_src = "built-in (not saved)";
+      print("OK built-in table in RAM - \"lens lut save\" to store it\r\n"); return true;
+    }
+    if (!strcmp(tok[2], "set") && nt >= 6 && parse_long(tok[3], &n) && parse_long(tok[4], &z) && parse_long(tok[5], &f)) {
+      if (n < 0 || n >= NLEVELS || z < 0 || z > s_zoom_far || f < 0 || f > FOCUS_TRAVEL_DEFAULT) { print("ERROR: lens lut set <0..5> <zoom> <focus> [sharp]\r\n"); return true; }
+      s_levels[n].zoom = z; s_levels[n].focus_cal = f;
+      if (nt >= 7 && parse_long(tok[6], &v) && v >= 0) s_levels[n].sharp = (uint32_t)v;
+      s_lut_src = "edited (not saved)";
+      snprintf(s_buf, sizeof s_buf, "OK L%ld = zoom %ld focus %ld (\"lens lut save\" to store)\r\n", n, z, f); print(s_buf); return true;
+    }
+    if (!strcmp(tok[2], "here") && nt >= 4 && parse_long(tok[3], &n)) {
+      if (n < 0 || n >= NLEVELS) { print("ERROR: level 0..5\r\n"); return true; }
+      if (!s_ax[LENS_ZOOM].referenced || !s_ax[LENS_FOCUS].referenced) { print("ERROR: home first\r\n"); return true; }
+      s_levels[n].zoom = s_ax[LENS_ZOOM].pos; s_levels[n].focus_cal = s_ax[LENS_FOCUS].pos;
+      if (nt >= 5 && parse_long(tok[4], &v) && v >= 0) s_levels[n].sharp = (uint32_t)v;
+      s_lut_src = "edited (not saved)";
+      snprintf(s_buf, sizeof s_buf, "OK L%ld = zoom %ld focus %ld (\"lens lut save\" to store)\r\n", n,
+               (long)s_levels[n].zoom, (long)s_levels[n].focus_cal); print(s_buf); return true;
+    }
+    if (!strcmp(tok[2], "far") && nt >= 4 && parse_long(tok[3], &v) && v > 0 && v <= 40000) {
+      s_zoom_far = v; s_ax[LENS_ZOOM].travel = v - 500; s_lut_src = "edited (not saved)";
+      print("OK zoom far stop set (applies to the zoom limit at the next home)\r\n"); return true;
+    }
+    print("ERROR: lens lut [save|load|default|set <n> <zoom> <focus> [sharp]|here <n> [sharp]|far <usteps>]\r\n");
     return true;
   }
   if (!strcmp(tok[1], "table") && nt >= 3) {
