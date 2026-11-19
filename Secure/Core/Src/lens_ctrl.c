@@ -341,7 +341,7 @@ static const Level_t s_levels_def[] = {     /* re-tuned 2026-11-19 18:20 */
 static Level_t  s_levels[NLEVELS];    /* live table: copy of the flash LUT (or the defaults) */
 static int32_t  s_zoom_far = ZOOM_FAR_STOP_DEF;
 static const char *s_lut_src = "built-in";
-#define LENS_FAST_BOOT     0          /* 1 = restore the logged position at boot (no homing) */
+#define LENS_FAST_BOOT     1          /* 1 = resume at the logged resting position (no motion); 0 = always full home */
 #define BOOT_LEVEL         (NLEVELS - 1)   /* power-up level: L9, the narrowest (user request 2026-11-19) */
 #define ZOOM_TRAVEL        33750      /* 500 short of the far stop (34250, 2026-11-18) */
 #define LENS_BOOT_SETTLE_MS   3000    /* driver power-up + UART settle before the first TMC config (was 1000; 3000 since 2026-11-19 rework) */
@@ -1088,20 +1088,24 @@ static void boot_decide(LensPrintFn print)
 {
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
   int32_t rz, rf;
-  /* LENS_FAST_BOOT 0 (user decision 2026-11-19): always full-home at boot.
-     Fast boot trusted the logged position and came up out of focus after
-     boot moves lost focus steps (L9 at 10 %, focus count off by >2500);
-     the full blind home is the only reference that repeats. ~2 min. */
+  /* Boot (user decision 2026-11-19 19:40): RESUME. If the position log ends
+     with a resting position (IDLE record), restore it and do not move: the
+     lens comes up where it was left. Moving at boot is what lost focus steps
+     before (fast boot to a fixed level: L9 at 10 %, count off by >2500).
+     A log ending in MOVE (power lost mid-move), or blank/corrupt -> full home
+     to BOOT_LEVEL (~2 min). A lens turned by hand while off is not detected:
+     "lens rehome". LENS_FAST_BOOT 0 = always full home. */
   if (LENS_FAST_BOOT && s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured && poslog_restore(&rz, &rf)) {
-    /* Fast boot: position known from the log -> direct moves to BOOT_LEVEL
-       (nothing to do if the lens rested there). */
     s_pl_enabled = true;
-    bool at = rz == s_levels[BOOT_LEVEL].zoom && rf == level_focus(BOOT_LEVEL);
-    if (!at) seq_plan(s_levels[BOOT_LEVEL].zoom, level_focus(BOOT_LEVEL), false);
-    s_level = BOOT_LEVEL; s_level_busy = true;
-    s_boot = 1;
-    snprintf(s_buf, sizeof s_buf, "[LENS] boot: position restored (zoom %ld focus %ld), %s level %d - no homing (\"lens rehome\" to re-reference)\r\n",
-             (long)rz, (long)rf, at ? "already at" : "direct move to", BOOT_LEVEL);
+    int lv = -1;
+    for (int i = 0; i < NLEVELS; i++)
+      if (rz == s_levels[i].zoom && rf == level_focus(i)) { lv = i; break; }
+    s_level = (int8_t)lv;
+    s_boot = 1;                        /* boot_task reports "ready" at once */
+    if (lv >= 0)
+      snprintf(s_buf, sizeof s_buf, "[LENS] boot: resumed at level %d (zoom %ld focus %ld) - no motion, no homing\r\n", lv, (long)rz, (long)rf);
+    else
+      snprintf(s_buf, sizeof s_buf, "[LENS] boot: resumed at zoom %ld focus %ld (no level) - no motion, no homing\r\n", (long)rz, (long)rf);
     print(s_buf);
   } else if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) {
     /* One motor at a time; each axis is homed twice: the first sequence

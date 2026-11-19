@@ -1,7 +1,9 @@
 # Lens control – test report 2026-11-19
 
-Firmware: branch `lens-rewrite`, image `firmware/proxy-mcu_Secure_2026-11-19_10levels.hex`
-(built from this commit's `Secure/Core/Src/lens_ctrl.c`, flashed 19:22 and boot-tested).
+Firmware: branch `lens-rewrite`.
+- `firmware/proxy-mcu_Secure_2026-11-19_resume.hex` – **current**: resume at the last resting
+  position on boot (flashed 19:38; board flash read back over SWD at 23:10 and matches the build).
+- `firmware/proxy-mcu_Secure_2026-11-19_10levels.hex` – previous: full home → L9 on every boot.
 
 Board: STM32H563 proxy MCU, TMC2300 drivers on 3.3 V (zoom = U2 @2, focus = U1 @0),
 Foctek D14-0622IR 6–22 mm lens. Target: chart board with a checkerboard column, 17 m away.
@@ -14,10 +16,10 @@ within one level and one camera position.
 | Area | Change |
 |---|---|
 | Levels | **10 levels** (was 6), zoom 10000…32500 about 2500 steps apart; all earlier tables discarded |
-| Boot level | **L9** (`BOOT_LEVEL = NLEVELS - 1`) |
-| Boot homing | **Full home on every boot** (`LENS_FAST_BOOT 0`) – the fast boot from the position log came up out of focus |
+| Boot | **Resume where the lens was left** (`LENS_FAST_BOOT 1`): the position log in flash gives the last resting zoom/focus; the drivers are configured and the lens is **not moved** (no homing, ready in seconds) |
+| Boot fallback | Log ending in a move (power lost mid-move), blank or corrupt → full home → **L9** (`BOOT_LEVEL = NLEVELS - 1`, ~2 min) |
 | Driver settle | `LENS_BOOT_SETTLE_MS` 1000 → **3000** ms before the first TMC2300 config |
-| Late driver config | Boot config retries in the background after the 10 boot attempts; the boot (home → L9) starts as soon as both drivers answer |
+| Late driver config | Boot config retries in the background after the 10 boot attempts; the boot (resume or home → L9) runs as soon as both drivers answer |
 | Driver reset watch | Once a second at rest: read GSTAT. `reset` set → re-configure, drop the reference, re-home. Silent driver → moves blocked until it answers |
 | Lookup table | New table in flash (sector 62) and as the built-in default; `lens_ui.json` has 10 presets |
 
@@ -77,11 +79,28 @@ Slower stepping did not improve focus on level moves, so the rate stays at 150 p
 | Flash (MCU reset) | full home → L9 | **106 %**, drivers on 1st attempt |
 | Hardware reset at L3 | full home → L9 | **102 %**, 137 s, drivers on 1st attempt |
 | Flash 19:22 (final image) | full home → L9 | at L9, drivers on 1st attempt |
+| Power cycle 19:35 | full home → L9 | **103 %** of the table value |
 
-The fast boot trusted the position logged in flash; boot moves after a reset or power cycle
-lost focus steps (normal level moves of the same length did not), and the error carried
-into every level until a re-home. Full homing on every boot (~2 min) was chosen instead.
-The position log is still written; `LENS_FAST_BOOT 1` restores the old behaviour.
+The first fast boot trusted the position logged in flash and then *moved* to L9; those boot
+moves after a reset or power cycle lost focus steps (normal level moves of the same length
+did not), and the error carried into every level until a re-home. Full homing on every boot
+(~2 min) was used from 19:30.
+
+#### Resume boot (current firmware, 19:38)
+The boot no longer moves the lens: it restores the last resting position from the log and
+stays there. The TMC2300 drivers hold no position of their own, and with the motors stopped
+and unpowered the lens does not move, so the logged position is still the real one.
+
+| Case | Result |
+|---|---|
+| Flash (MCU reset) at L9 | resumed L9, no motion, ready in 13 s – **100 %** (47379 vs 47390), drivers on 1st attempt |
+| Hardware reset at L3 | resumed L3, no motion, ready in 7 s – **100 %** (81584 vs 81282), drivers on 1st attempt |
+| Power cycle at L3 (20:07) | resumed L3, no motion – **106 %** (86624), drivers on 1st attempt |
+| Power cycles 20:09, 20:12 | VF_UART held low, drivers silent – background retry, lens untouched (hardware, see below) |
+| Power cycle 20:26, after R59 removed | drivers on 2nd attempt, resumed L9, no motion; image sharp at 23:10, no driver errors in 2 h 42 min |
+
+Not tested: power cut during a move (log ends in MOVE → full home → L9 by design). A lens
+turned by hand while the board is off is not detected – run `lens rehome`.
 
 ## Hardware findings (schematic `SCH_PROXY_ BOARD_V1.pdf` p.4–5, TMC2300 datasheet rev 1.09)
 
@@ -98,12 +117,16 @@ The position log is still written; `LENS_FAST_BOOT 1` restores the old behaviour
   reset watch catches this (GSTAT.reset).
 
 Rework done 2026-11-19 (by the user): R55 removed (PA9–PA10 0 Ω link), VIO/nSTBY on 3.3 V,
-iris driver disabled. After the rework the drivers answered on most power cycles; once
-(18:59) VF_UART stayed low and neither driver answered. Suggested: remove R59 so the disabled
-U5 is fully off the bus (a disabled TMC2300 back-powered through PDN_UART can hold the line).
+iris driver disabled. After that rework VF_UART stayed low with neither driver answering on
+3 of about 6 power cycles (18:59, 20:09, 20:12), with PA9 configured correctly and the
+pull-up fitted. Suspected cause: the disabled U5 back-powered through R59/PDN_UART holding
+the line. **R59 removed at ~20:26** (U5 fully off the bus): the next power cycle came up
+normally. One good cycle is not proof yet – more power cycles are needed to confirm.
 
 ## Open points
-- One power cycle after the rework left the driver bus stuck low (see above) – hardware.
+- Driver bus stuck low after power cycles – R59 removed, first cycle good; confirm with more cycles.
+  If it recurs, measure VF_UART while stuck: ~0.6 V = ESD clamp from an unpowered VIO,
+  0 V = a driver pulling low (lift R47/R25 one at a time).
 - Moves down are slightly less accurate than moves up (93–98 % vs 96–106 %).
-- Boot takes ~2 min (full home), by choice.
+- Mid-move power cut not tested (falls back to a ~2 min full home → L9).
 - The sharpness reference values belong to the current camera aim.
