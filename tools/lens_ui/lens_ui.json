@@ -28,14 +28,54 @@
   },
   "stages": [
     {
-      "name": "L0 (2026-11-18 cal: zoom far stop 34250 - 500)",
-      "zoom": 33750,
-      "focus": 28100
+      "name": "L0 (2026-11-19 retune 18:20)",
+      "zoom": 10000,
+      "focus": 600
     },
     {
-      "name": "Stage 2",
-      "zoom": 72000,
-      "focus": 9854
+      "name": "L1 (2026-11-19 retune 18:20)",
+      "zoom": 12750,
+      "focus": 2000
+    },
+    {
+      "name": "L2 (2026-11-19 retune 18:20)",
+      "zoom": 15250,
+      "focus": 3200
+    },
+    {
+      "name": "L3 (2026-11-19 retune 18:20)",
+      "zoom": 17500,
+      "focus": 4400
+    },
+    {
+      "name": "L4 (2026-11-19 retune 18:20)",
+      "zoom": 20000,
+      "focus": 6050
+    },
+    {
+      "name": "L5 (2026-11-19 retune 18:20)",
+      "zoom": 22500,
+      "focus": 7950
+    },
+    {
+      "name": "L6 (2026-11-19 retune 18:20)",
+      "zoom": 24750,
+      "focus": 10200
+    },
+    {
+      "name": "L7 (2026-11-19 retune 18:20)",
+      "zoom": 27500,
+      "focus": 13400
+    },
+    {
+      "name": "L8 (2026-11-19 retune 18:20)",
+      "zoom": 30000,
+      "focus": 17600
+    },
+    {
+      "name": "L9 (2026-11-19 retune 18:20)",
+      "zoom": 32500,
+      "focus": 24550
     }
   ]
 }

@@ -189,6 +189,9 @@ static void axis_finish(Axis_t *a, Evt_t why)
 }
 
 static void poslog_moving(void);
+static void boot_decide(LensPrintFn print);
+static LensPrintFn s_print;           /* console print, for messages from LENS_Task */
+static bool        s_cfg_pending;     /* boot config failed: keep retrying, then boot */
 static void poslog_task(void);
 static void axis_start(Axis_t *a, int dir, bool jog, int32_t target, uint32_t max_pps)
 {
@@ -298,56 +301,50 @@ static bool can_move(LensAxis_t ax)
 
 /* ===================================================== zoom levels ====
    Ported from the MSP430 varifocal firmware (MSP430_Varifocal/main.c, v1.5):
-   6 zoom levels with a focus position each. Mapped onto this lens 2026-11-17
+   Zoom levels (NLEVELS, 10 since 2026-11-19) with a focus position each. Mapped onto this lens 2026-11-17
    (tools/focus_cal/results.json "zoom_focus_curve", "zoom_far_stop",
    "msp_level_verify*"):
    - both boards count 1/16 steps (1:1 scale fits the measured curve);
    - MSP zoom home (level 0, "fully zoomed out") = our zoom FAR stop, which is
      ~33300 above our zoom reverse stop; MSP zoom levels count back from it;
    - MSP focus home = our focus reverse stop (same direction).
-   focus_msp: MSP focus_level[] as written for its own scene (zoom-in table).
-   focus_cal: best focus measured on this camera (day mode, centre-1/3 Sobel,
-   home + approach from below), used by default; "lens table msp" switches.
-     Re-calibrated 2026-11-17 18:10 (tools/focus_cal/results.json
-     "recal_zoom_far", "recal_level"): far stop 33250 by image change in
-     500 steps; each level = home + coarse 1000 + fine 100, then checked by
-     going back and by a full repeat with zoom re-homed (all within 3 %).
-     level  zoom   focus_msp  focus_cal  sharpness (back / full repeat)
-       0   33750    25600      28100     48000 (41433 / 40413)  stop - 500
-         (L0 re-calibrated 2026-11-18 15:18: far stop 34250, was 33250 /
-          32750 / 27000; power-cycle test 42775, peak flat 28000..28300.
-          L1..L5 focus re-tuned 2026-11-18 16:45 at the same zoom steps:
-          16600/11000/7200/4400/2300 -> 15450/10300/6700/4100/2000, sharpness
-          2747/4789/7920/13933/28990 -> 53829/52480/49472/49788/54697.
-          Zoom +-250/+-500 with focus re-tuned gave no clear gain (<3 %),
-          so the zoom steps stay.)
-       1   29250    20800      16600     23206 (23254 / 23811)
-       2   25250    14200      11000     28199 (27842 / 27350)
-       3   21250     9200       7200     31287 (31109 / 30595)
-       4   17250     5400       4400     33595 (33647 / 32767)
-       5   13250     1600       2300     34341 (33994 / 34691)
+   focus_cal: best focus measured on this camera, used by default.
+   focus_msp: the MSP430 column is obsolete; it holds the same values, so
+   "lens table msp" makes no difference.
+     Calibrated 2026-11-19 15:33 (all earlier tables discarded): checkerboard
+     on the chart board 17 m away, Sobel energy on the checkerboard column;
+     re-home, then levels in ascending order, focus scanned +-1200 around a
+     prediction (200, then 100/50 around the peak) - no full-range sweeps,
+     which lost steps on the long moves down. Zoom below 10000 cannot focus at
+     17 m (needs focus under the home stop). Focus mechanical end ~33000.
+     Table: see s_levels_def.
    Zoom is referenced to its REVERSE stop = 0 (repeatable); the far stop is
    only used through the table. Focus 0 = its real reverse stop (home at
    100 pps; 300 pps stalls 800..1600 short). Long moves down lose steps, so a
    level change re-homes any axis that has to move down, then comes up. */
 typedef struct { int32_t zoom, focus_msp, focus_cal; uint32_t sharp; } Level_t;
-/* Built-in lookup table (calibrated 2026-11-18). "sharp" = centre-1/3 Sobel
-   energy measured at that step on the bench (focus chart scene, 960x540
-   RTSP frames) - a reference for later checks, not used for motion.
-   The live table (s_levels) is loaded from flash at boot (see "lookup table
-   in flash" below); these values seed the flash when it holds no valid table. */
-static const Level_t s_levels_def[] = {
-  { 33750, 25600, 28100, 43225 }, { 29250, 20800, 15450, 53829 }, { 25250, 14200, 10300, 52480 },
-  { 21250,  9200,  6700, 49472 }, { 17250,  5400,  4100, 49788 }, { 13250,  1600,  2000, 54697 },
+/* Built-in lookup table (calibrated 2026-11-19 15:33, 10 levels). L0 = zoom
+   10000 (widest zoom that focuses at 17 m), levels 2500 zoom steps apart for
+   shorter moves. "sharp" = Sobel energy on the checkerboard column of the
+   chart board 17 m away (960x540 RTSP frames) - a reference, not used for
+   motion; compare only within a level. The MSP430 focus column is obsolete
+   and holds the same values. The live table (s_levels) is loaded from flash
+   at boot; these values seed the flash when it holds no valid table. */
+static const Level_t s_levels_def[] = {     /* re-tuned 2026-11-19 18:20 */
+  { 10000,   600,   600, 95498 }, { 12750,  2000,  2000, 91400 }, { 15250,  3200,  3200, 91121 },
+  { 17500,  4400,  4400, 81638 }, { 20000,  6050,  6050, 81399 }, { 22500,  7950,  7950, 77925 },
+  { 24750, 10200, 10200, 71559 }, { 27500, 13400, 13400, 63365 }, { 30000, 17600, 17600, 56095 },
+  { 32500, 24550, 24550, 45261 },
 };
 #define NLEVELS            ((int)(sizeof s_levels_def / sizeof s_levels_def[0]))
 #define ZOOM_FAR_STOP_DEF  34250      /* zoom far stop found 2026-11-18 (image-change scan) */
 static Level_t  s_levels[NLEVELS];    /* live table: copy of the flash LUT (or the defaults) */
 static int32_t  s_zoom_far = ZOOM_FAR_STOP_DEF;
 static const char *s_lut_src = "built-in";
-#define BOOT_LEVEL         0
+#define LENS_FAST_BOOT     0          /* 1 = restore the logged position at boot (no homing) */
+#define BOOT_LEVEL         (NLEVELS - 1)   /* power-up level: L9, the narrowest (user request 2026-11-19) */
 #define ZOOM_TRAVEL        33750      /* 500 short of the far stop (34250, 2026-11-18) */
-#define LENS_BOOT_SETTLE_MS   1000    /* driver power-up settle before the first UART config */
+#define LENS_BOOT_SETTLE_MS   3000    /* driver power-up + UART settle before the first TMC config (was 1000; 3000 since 2026-11-19 rework) */
 #define LENS_BOOT_CFG_TRIES   10      /* config attempts at boot ... */
 #define LENS_BOOT_CFG_GAP_MS  200     /* ... this far apart */
 #define LENS_TMC_BAUD         115200u /* TMC2300 UART (see LENS_Init) */
@@ -568,7 +565,7 @@ static void seq_plan(int32_t zt, int32_t ft, bool full)
 static bool level_go(int l)
 {
   if (!boot_check()) return false;
-  if (l < 0 || l >= NLEVELS) { s_err = "level 0..5"; return false; }
+  if (l < 0 || l >= NLEVELS) { s_err = "level 0..9"; return false; }
   if (LENS_IsMoving(LENS_ZOOM) || LENS_IsMoving(LENS_FOCUS) || seq_active()) { s_err = "busy"; return false; }
   if (s_levels[l].zoom > s_ax[LENS_ZOOM].max_pos && s_ax[LENS_ZOOM].limits_on) { s_err = "outside soft limits"; return false; }
   seq_plan(s_levels[l].zoom, level_focus(l), false);
@@ -630,8 +627,95 @@ static void boot_task(void)
   }
 }
 
+/* Late driver config: the boot retries (LENS_BOOT_CFG_TRIES) ran out with a
+   driver silent. Keep trying every 500 ms (every 2 s after the first 30 s)
+   and run the normal boot (fast boot or homing) as soon as both answer -
+   instead of leaving both axes unreferenced until someone types "lens init". */
+static void cfg_retry_task(void)
+{
+  static uint32_t next, t0, n;
+  if (!s_cfg_pending) return;
+  uint32_t now = HAL_GetTick();
+  if (!t0) t0 = now;
+  if ((int32_t)(now - next) < 0) return;
+  next = now + ((now - t0) < 30000u ? 500u : 2000u);
+  Axis_t *z = &s_ax[LENS_ZOOM], *f = &s_ax[LENS_FOCUS];
+  if (!z->configured || !f->configured) {
+    uint8_t sync = 0;                  /* let the TMC auto-baud lock again */
+    HAL_UART_Abort(&huart1);
+    HAL_HalfDuplex_EnableTransmitter(&huart1);
+    HAL_UART_Transmit(&huart1, &sync, 1, 10);
+    HAL_Delay(2);
+    if (!z->configured) drv_config(z);
+    if (!f->configured) drv_config(f);
+    n++;
+  }
+  if (z->configured && f->configured) {
+    s_cfg_pending = false;
+    if (s_print) {
+      snprintf(s_buf, sizeof s_buf, "[LENS] driver config: ok after %lu more attempt(s), %lu ms after boot\r\n",
+               (unsigned long)n, (unsigned long)(now - t0));
+      s_print(s_buf);
+    }
+    boot_decide(s_print);
+  }
+}
+
+/* Driver reset watch (idle only, once a second). A TMC2300 that browns out
+   or resets comes back with its power-up defaults - 1/32 microsteps instead
+   of 1/16, default currents - while the firmware keeps counting 1/16 steps:
+   every later move covers half the distance and the lens ends up far from
+   its counted position with no sign of a lost step. GSTAT.reset tells.
+   On a reset: re-configure, drop the reference, re-home (back to the level).
+   A driver that stops answering is marked not configured (moves refused)
+   until it answers again. */
+static void drv_watch_task(void)
+{
+  static uint32_t next;
+  static uint8_t miss[2];
+  static bool drv_err_said[2];
+  if (s_cfg_pending || s_boot || seq_active() || s_level_busy || !all_idle()) return;
+  uint32_t now = HAL_GetTick();
+  if ((int32_t)(now - next) < 0) return;
+  next = now + 1000u;
+  bool rehome = false;
+  for (int i = LENS_ZOOM; i <= LENS_FOCUS; i++) {
+    Axis_t *a = &s_ax[i];
+    uint32_t g;
+    if (!tmc_read(a->addr, R_GSTAT, &g)) {
+      if (miss[i] < 255) miss[i]++;
+      if (miss[i] == 3 && a->configured) {
+        a->configured = false;
+        if (s_print) { snprintf(s_buf, sizeof s_buf, "[LENS] %s driver stopped answering - moves blocked until it answers\r\n", LENS_AxisName[i]); s_print(s_buf); }
+      }
+      continue;
+    }
+    bool was_lost = miss[i] >= 3;
+    miss[i] = 0;
+    if (g & 0x1u) {                     /* reset since the last GSTAT clear */
+      drv_config(a);
+      if (a->referenced) { a->referenced = false; rehome = true; }
+      poslog_moving();                  /* next boot homes unless re-referenced */
+      if (s_print) { snprintf(s_buf, sizeof s_buf, "[LENS] %s driver RESET detected (supply dip?) - re-configured %s, position lost%s\r\n",
+                              LENS_AxisName[i], a->configured ? "ok" : "FAILED", a->configured ? " - re-homing" : ""); s_print(s_buf); }
+    } else if (!a->configured) {
+      if (was_lost) a->configured = true;   /* registers kept (no reset): usable again */
+      else drv_config(a);                    /* never finished its config */
+      if (s_print) { snprintf(s_buf, sizeof s_buf, "[LENS] %s driver answers again (no reset), %s\r\n",
+                              LENS_AxisName[i], a->configured ? "ok" : "config FAILED"); s_print(s_buf); }
+    }
+    if ((g & 0x2u) && !drv_err_said[i] && s_print) {
+      drv_err_said[i] = true;
+      snprintf(s_buf, sizeof s_buf, "[LENS] %s driver error flag (overtemp/short) - see lens status\r\n", LENS_AxisName[i]); s_print(s_buf);
+    }
+  }
+  if (rehome && s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) rehome_go();
+}
+
 void LENS_Task(void)
 {
+  cfg_retry_task();
+  drv_watch_task();
   for (int i = 0; i < LENS_NAXIS; i++) {
     Axis_t *a = &s_ax[i];
     if (a->running && a->jog && a->jog_until && (int32_t)(HAL_GetTick() - a->jog_until) >= 0) {
@@ -985,24 +1069,39 @@ void LENS_Init(LensPrintFn print)
     print(s_buf);
   }
   s_ax[LENS_ZOOM].travel = s_zoom_far - 500;
-  snprintf(s_buf, sizeof s_buf, "[LENS] driver config: %s after %d attempt(s), %d ms settle, %lu baud\r\n",
-           (u1->configured && u2->configured) ? "ok" : "FAILED",
-           tries < LENS_BOOT_CFG_TRIES ? tries + 1 : tries, LENS_BOOT_SETTLE_MS, (unsigned long)huart1.Init.BaudRate);
+  s_print = print;
+  bool ok = u1->configured && u2->configured;
+  snprintf(s_buf, sizeof s_buf, "[LENS] driver config: %s after %d attempt(s), %d ms settle, %lu baud%s\r\n",
+           ok ? "ok" : "FAILED",
+           tries < LENS_BOOT_CFG_TRIES ? tries + 1 : tries, LENS_BOOT_SETTLE_MS, (unsigned long)huart1.Init.BaudRate,
+           ok ? "" : " - retrying in the background, boot continues when both answer");
   print(s_buf);
   print_status(print);
+  if (ok) boot_decide(print);
+  else    s_cfg_pending = true;            /* LENS_Task keeps retrying (cfg_retry_task) */
+}
 
+/* Boot decision, once both drivers are configured: restore the logged
+   position (fast boot) or home both. Called from LENS_Init, or later from
+   cfg_retry_task when a driver answered only after the boot retries. */
+static void boot_decide(LensPrintFn print)
+{
   /* Boot: home both, then zoom -> fixed step, focus -> calibrated best. */
   int32_t rz, rf;
-  if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured && poslog_restore(&rz, &rf)) {
-    /* Fast boot: position known from the log -> direct moves to level 0
-       (nothing to do if the lens rested at level 0). */
+  /* LENS_FAST_BOOT 0 (user decision 2026-11-19): always full-home at boot.
+     Fast boot trusted the logged position and came up out of focus after
+     boot moves lost focus steps (L9 at 10 %, focus count off by >2500);
+     the full blind home is the only reference that repeats. ~2 min. */
+  if (LENS_FAST_BOOT && s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured && poslog_restore(&rz, &rf)) {
+    /* Fast boot: position known from the log -> direct moves to BOOT_LEVEL
+       (nothing to do if the lens rested there). */
     s_pl_enabled = true;
     bool at = rz == s_levels[BOOT_LEVEL].zoom && rf == level_focus(BOOT_LEVEL);
     if (!at) seq_plan(s_levels[BOOT_LEVEL].zoom, level_focus(BOOT_LEVEL), false);
     s_level = BOOT_LEVEL; s_level_busy = true;
     s_boot = 1;
-    snprintf(s_buf, sizeof s_buf, "[LENS] boot: position restored (zoom %ld focus %ld), %s - no homing (\"lens rehome\" to re-reference)\r\n",
-             (long)rz, (long)rf, at ? "already at level 0" : "direct move to level 0");
+    snprintf(s_buf, sizeof s_buf, "[LENS] boot: position restored (zoom %ld focus %ld), %s level %d - no homing (\"lens rehome\" to re-reference)\r\n",
+             (long)rz, (long)rf, at ? "already at" : "direct move to", BOOT_LEVEL);
     print(s_buf);
   } else if (s_ax[LENS_ZOOM].configured && s_ax[LENS_FOCUS].configured) {
     /* One motor at a time; each axis is homed twice: the first sequence
@@ -1013,7 +1112,8 @@ void LENS_Init(LensPrintFn print)
     seq_plan(s_levels[BOOT_LEVEL].zoom, level_focus(BOOT_LEVEL), true);
     s_level = BOOT_LEVEL; s_level_busy = true;
     s_boot = 1;
-    print("[LENS] boot: no valid saved position - focus home + 10000, zoom home + level 0, focus home + level 0 (~2 min)\r\n");
+    snprintf(s_buf, sizeof s_buf, "[LENS] boot: full home (every boot) - focus home + 10000, zoom home + level %d, focus home + level %d (~2 min)\r\n", BOOT_LEVEL, BOOT_LEVEL);
+    print(s_buf);
   } else {
     print("[LENS] boot homing not started: driver not configured\r\n");
   }
@@ -1098,7 +1198,7 @@ static void print_help(LensPrintFn print)
   print("  lens <ax> cur <irun> [ihold]     0..31 (voltage mode: amplitude = VS*(irun+1)/32)\r\n");
   print("  lens z lock | unlock            zoom moves only through levels while locked (default)\r\n");
   print("  lens <ax> reg <r> [val]          raw TMC2300 register read/write\r\n");
-  print("  lens level [n] | zoomin | zoomout  zoom level 0..5 (MSP430 table) with its focus\r\n");
+  print("  lens level [n] | zoomin | zoomout  zoom level 0..9 (MSP430 table) with its focus\r\n");
   print("  lens table cal|msp               focus column: this camera's / MSP430 values\r\n");
   print("  lens lut                         level lookup table (zoom, focus, sharpness) in flash\r\n");
   print("  lens lut set <n> <z> <f> [sharp] | here <n> [sharp] | far <usteps>   edit in RAM\r\n");
@@ -1251,7 +1351,7 @@ bool LENS_CLI(const char *cmd, LensPrintFn print)
         print(s_buf);
       }
       return true;
-    } else if (!parse_long(tok[2], &l)) { print("ERROR: lens level <0..5>\r\n"); return true; }
+    } else if (!parse_long(tok[2], &l)) { print("ERROR: lens level <0..9>\r\n"); return true; }
     if (l < 0 || l >= NLEVELS) { print(l < 0 ? "Reached MIN level\r\n" : "Reached MAX level\r\n"); return true; }
     if (level_go((int)l)) snprintf(s_buf, sizeof s_buf, "OK level %ld: zoom %ld focus %ld\r\n", l,
                                    (long)s_levels[l].zoom, (long)level_focus((int)l));
@@ -1309,14 +1409,14 @@ bool LENS_CLI(const char *cmd, LensPrintFn print)
       print("OK built-in table in RAM - \"lens lut save\" to store it\r\n"); return true;
     }
     if (!strcmp(tok[2], "set") && nt >= 6 && parse_long(tok[3], &n) && parse_long(tok[4], &z) && parse_long(tok[5], &f)) {
-      if (n < 0 || n >= NLEVELS || z < 0 || z > s_zoom_far || f < 0 || f > FOCUS_TRAVEL_DEFAULT) { print("ERROR: lens lut set <0..5> <zoom> <focus> [sharp]\r\n"); return true; }
+      if (n < 0 || n >= NLEVELS || z < 0 || z > s_zoom_far || f < 0 || f > FOCUS_TRAVEL_DEFAULT) { print("ERROR: lens lut set <0..9> <zoom> <focus> [sharp]\r\n"); return true; }
       s_levels[n].zoom = z; s_levels[n].focus_cal = f;
       if (nt >= 7 && parse_long(tok[6], &v) && v >= 0) s_levels[n].sharp = (uint32_t)v;
       s_lut_src = "edited (not saved)";
       snprintf(s_buf, sizeof s_buf, "OK L%ld = zoom %ld focus %ld (\"lens lut save\" to store)\r\n", n, z, f); print(s_buf); return true;
     }
     if (!strcmp(tok[2], "here") && nt >= 4 && parse_long(tok[3], &n)) {
-      if (n < 0 || n >= NLEVELS) { print("ERROR: level 0..5\r\n"); return true; }
+      if (n < 0 || n >= NLEVELS) { print("ERROR: level 0..9\r\n"); return true; }
       if (!s_ax[LENS_ZOOM].referenced || !s_ax[LENS_FOCUS].referenced) { print("ERROR: home first\r\n"); return true; }
       s_levels[n].zoom = s_ax[LENS_ZOOM].pos; s_levels[n].focus_cal = s_ax[LENS_FOCUS].pos;
       if (nt >= 5 && parse_long(tok[4], &v) && v >= 0) s_levels[n].sharp = (uint32_t)v;
@@ -1352,7 +1452,7 @@ bool LENS_CLI(const char *cmd, LensPrintFn print)
      ZERO Z|F|ALL           pos := 0 here     -> OK ZERO
      P  or  ?               positions         -> POS Z <pos> <moving> F <pos> <moving>
      FB                     focus to the level's focus -> OK F <pos>
-     L <n> / L              zoom level 0..5 / query -> OK L <n> / LEVEL <n>
+     L <n> / L              zoom level 0..9 / query -> OK L <n> / LEVEL <n>
      ZI  ZO                 zoom level +1 / -1 -> OK L <n>; then DONE Z <pos> level
      V                      version           -> VER PROXY-LENS 3
    At boot the MCU homes both axes, moves zoom to its fixed step and focus to
